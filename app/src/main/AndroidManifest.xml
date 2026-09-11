@@ -1,37 +1,109 @@
 <?xml version="1.0" encoding="utf-8"?>
-<manifest xmlns:android="http://schemas.android.com/apk/res/android">
+<LinearLayout xmlns:android="http://schemas.android.com/apk/res/android"
+    android:layout_width="match_parent"
+    android:layout_height="match_parent"
+    android:background="#121212"
+    android:orientation="vertical"
+    android:padding="16dp">
 
-    <uses-permission android:name="android.permission.INTERNET" />
-    <uses-permission android:name="android.permission.ACCESS_NETWORK_STATE" />
-    <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
-    <uses-permission android:name="android.permission.FOREGROUND_SERVICE_MEDIA_PLAYBACK" />
-    <uses-permission android:name="android.permission.FOREGROUND_SERVICE_DATA_SYNC" />
-    <uses-permission android:name="android.permission.WAKE_LOCK" />
+    <!-- 标题 -->
+    <TextView
+        android:layout_width="wrap_content"
+        android:layout_height="wrap_content"
+        android:text="长江云直播助手 (HBTV Bridge)"
+        android:textColor="#FFFFFF"
+        android:textSize="20sp"
+        android:textStyle="bold" />
 
-    <application
-        android:allowBackup="true"
-        android:icon="@drawable/ic_launcher"
-        android:label="长江云直播助手"
-        android:roundIcon="@drawable/ic_launcher"
-        android:supportsRtl="true"
-        android:theme="@style/Theme.MaterialComponents.Light.NoActionBar"
-        android:usesCleartextTraffic="true">
+    <!-- 订阅源地址显示框 -->
+    <TextView
+        android:id="@+id/tvM3uUrl"
+        android:layout_width="match_parent"
+        android:layout_height="wrap_content"
+        android:layout_marginTop="10dp"
+        android:background="#1E1E1E"
+        android:padding="12dp"
+        android:text="播放列表: http://127.0.0.1:8899/live.m3u"
+        android:textColor="#4CAF50"
+        android:textIsSelectable="true"
+        android:textSize="14sp" />
 
-        <activity
-            android:name=".MainActivity"
-            android:exported="true">
-            <intent-filter>
-                <action android:name="android.intent.action.MAIN" />
-                <category android:name="android.intent.category.LAUNCHER" />
-                <category android:name="android.intent.category.LEANBACK_LAUNCHER" />
-            </intent-filter>
-        </activity>
+    <!-- 操作按钮区 -->
+    <LinearLayout
+        android:layout_width="match_parent"
+        android:layout_height="wrap_content"
+        android:layout_marginTop="12dp"
+        android:orientation="horizontal">
 
-        <service
-            android:name=".BridgeService"
-            android:enabled="true"
-            android:exported="false"
-            android:foregroundServiceType="mediaPlayback|dataSync" />
-    </application>
+        <Button
+            android:id="@+id/btnToggle"
+            android:layout_width="0dp"
+            android:layout_height="wrap_content"
+            android:layout_weight="1"
+            android:backgroundTint="#2196F3"
+            android:focusable="true"
+            android:text="启动服务"
+            android:textColor="#FFFFFF" />
 
-</manifest>
+        <Button
+            android:id="@+id/btnCopy"
+            android:layout_width="wrap_content"
+            android:layout_height="wrap_content"
+            android:layout_marginStart="8dp"
+            android:backgroundTint="#00897B"
+            android:focusable="true"
+            android:text="复制日志"
+            android:textColor="#FFFFFF" />
+
+        <Button
+            android:id="@+id/btnClear"
+            android:layout_width="wrap_content"
+            android:layout_height="wrap_content"
+            android:layout_marginStart="8dp"
+            android:backgroundTint="#424242"
+            android:focusable="true"
+            android:text="清空"
+            android:textColor="#FFFFFF" />
+    </LinearLayout>
+
+    <!-- 日志区域提示 -->
+    <TextView
+        android:layout_width="wrap_content"
+        android:layout_height="wrap_content"
+        android:layout_marginTop="14dp"
+        android:text="实时运行日志 (长按可单选/全选复制):"
+        android:textColor="#AAAAAA"
+        android:textSize="13sp" />
+
+    <!-- 滚动日志控制台 -->
+    <ScrollView
+        android:id="@+id/scrollView"
+        android:layout_width="match_parent"
+        android:layout_height="0dp"
+        android:layout_marginTop="8dp"
+        android:layout_weight="1"
+        android:background="#000000"
+        android:padding="8dp">
+
+        <!-- 开启文本自由单选、全选和复制 -->
+        <TextView
+            android:id="@+id/tvLogs"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:clickable="true"
+            android:focusable="true"
+            android:fontFamily="monospace"
+            android:longClickable="true"
+            android:textIsSelectable="true"
+            android:textColor="#00FF66"
+            android:textSize="11sp" />
+    </ScrollView>
+
+    <!-- 1x1 隐藏容器，用于强制挂载 WebView 防止被系统休眠挂起 -->
+    <LinearLayout
+        android:id="@+id/hiddenWebContainer"
+        android:layout_width="1dp"
+        android:layout_height="1dp"
+        android:visibility="invisible"
+        android:orientation="vertical" />
+</LinearLayout>
