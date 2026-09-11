@@ -1,7 +1,7 @@
 name: Build APK
 
 on:
-  workflow_dispatch: # 支持手动点击运行
+  workflow_dispatch: # 支持手动点击按钮运行
 
 jobs:
   build:
@@ -16,14 +16,19 @@ jobs:
           java-version: '17'
           distribution: 'temurin'
 
+      # 直接在云端安装官方 Gradle 8.2，彻底摆脱对 gradlew 文件的依赖
       - name: Setup Gradle
         uses: gradle/actions/setup-gradle@v3
+        with:
+          gradle-version: '8.2'
 
+      # 直接调用 gradle 命令编译 Debug 包（Debug 包自带签名，电视盒子可以直接安装）
       - name: Build with Gradle
-        run: ./gradlew assembleRelease --stacktrace || ./gradlew assembleDebug
+        run: gradle assembleDebug --stacktrace
 
+      # 上传生成的 APK 文件
       - name: Upload APK
         uses: actions/upload-artifact@v4
         with:
           name: HBTV-Bridge-APK
-          path: app/build/outputs/apk/**/*.apk
+          path: app/build/outputs/apk/debug/*.apk
