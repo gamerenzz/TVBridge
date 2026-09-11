@@ -2,19 +2,22 @@ package com.hbtv.bridge
 
 import android.annotation.SuppressLint
 import android.app.*
+import android.content.ClipData
+import android.content.ClipboardManager
 import android.content.Context
 import android.content.Intent
+import android.net.http.SslError
 import android.os.Build
 import android.os.Bundle
 import android.os.Handler
 import android.os.IBinder
 import android.os.Looper
-import android.webkit.WebSettings
-import android.webkit.WebView
-import android.webkit.WebViewClient
+import android.view.ViewGroup
+import android.webkit.*
 import android.widget.Button
 import android.widget.ScrollView
 import android.widget.TextView
+import android.widget.Toast
 import androidx.appcompat.app.AppCompatActivity
 import androidx.core.app.NotificationCompat
 import com.hbtv.bridge.R
@@ -44,8 +47,10 @@ val CHANNELS = listOf(
     Channel("438", "hbls", "垄上频道")
 )
 
+const val PC_UA = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+
 // ==========================================
-// 2. 全局日志管理器 (支持界面刷新)
+// 2. 全局日志管理器
 // ==========================================
 object LogManager {
     private val sdf = SimpleDateFormat("HH:mm:ss", Locale.getDefault())
@@ -54,7 +59,7 @@ object LogManager {
 
     fun log(msg: String) {
         val entry = "[${sdf.format(Date())}] $msg"
-        if (logList.size > 200) logList.removeAt(0)
+        if (logList.size > 300) logList.removeAt(0)
         logList.add(entry)
         onLogListener?.invoke(entry)
     }
@@ -64,7 +69,7 @@ object LogManager {
 }
 
 // ==========================================
-// 3. 6个 WebView 常驻心跳与定时续期池
+// 3. 6个 WebView 常驻心跳与定时续期池 (核心防休眠增强)
 // ==========================================
 @SuppressLint("SetJavaScriptEnabled")
 object WebViewKeeper {
@@ -74,25 +79,45 @@ object WebViewKeeper {
 
     fun getUrl(cid: String): String? = liveUrls[cid]
 
-    fun init(context: Context) {
+    fun init(context: Context, container: ViewGroup? = null) {
         mainHandler.post {
             try {
+                // 开启 Cookie 支持
+                CookieManager.getInstance().setAcceptCookie(true)
+
                 for (ch in CHANNELS) {
                     if (webViewMap.containsKey(ch.id)) continue
-                    val wv = WebView(context).apply {
+                    val wv = WebView(context.applicationContext).apply {
                         settings.javaScriptEnabled = true
                         settings.domStorageEnabled = true
+                        settings.databaseEnabled = true
                         settings.mediaPlaybackRequiresUserGesture = false
+                        settings.mixedContentMode = WebSettings.MIXED_CONTENT_ALWAYS_ALLOW
+                        settings.userAgentString = PC_UA // 强制使用桌面端 UA
                         settings.cacheMode = WebSettings.LOAD_NO_CACHE
+
+                        CookieManager.getInstance().setAcceptThirdPartyCookies(this, true)
 
                         webViewClient = object : WebViewClient() {
                             override fun onPageFinished(view: WebView?, url: String?) {
-                                LogManager.log("[${ch.name}] 页面已加载，开始抓流...")
-                                scheduleCheck(ch.id)
+                                LogManager.log("[${ch.name}] 页面就绪，激发播放器...")
+                                scheduleCheck(ch.id, 1)
+                            }
+
+                            override fun onReceivedSslError(view: WebView?, handler: SslErrorHandler?, error: SslError?) {
+                                handler?.proceed() // 忽略证书异常，防止 CDN 被拦截
                             }
                         }
+
+                        // 唤醒内核渲染与心跳
+                        onResume()
+                        resumeTimers()
+
                         loadUrl("https://news.hbtv.com.cn/app/tv/${ch.id}")
                     }
+
+                    // 挂载到不可见视图容器，防止系统判定为游离进程而冻结
+                    container?.addView(wv)
                     webViewMap[ch.id] = wv
                 }
                 schedulePeriodicReload()
@@ -102,27 +127,49 @@ object WebViewKeeper {
         }
     }
 
-    private fun scheduleCheck(cid: String, attempts: Int = 0) {
-        if (attempts > 12) return
+    private fun scheduleCheck(cid: String, attempts: Int) {
+        if (attempts > 20) {
+            val name = CHANNELS.find { it.id == cid }?.name ?: cid
+            LogManager.log("[$name] 抓取超时，重载页面中...")
+            webViewMap[cid]?.reload()
+            return
+        }
+
         mainHandler.postDelayed({
             val wv = webViewMap[cid] ?: return@postDelayed
-            val js = "(function(){ var v=document.querySelector('video'); if(v){ v.muted=true; try{v.play();}catch(e){} return v.currentSrc; } return ''; })()"
+            // 执行播放器激活脚本并取值
+            val js = """
+                (function(){
+                    var v = document.querySelector('video');
+                    if (v) {
+                        v.muted = true;
+                        try { v.play(); } catch(e){}
+                        if (v.currentSrc && v.currentSrc.length > 5) return v.currentSrc;
+                        if (v.src && v.src.length > 5) return v.src;
+                    }
+                    return '';
+                })()
+            """.trimIndent()
+
             wv.evaluateJavascript(js) { res ->
                 val cleaned = res?.trim('"', '\'', ' ') ?: ""
+                val name = CHANNELS.find { it.id == cid }?.name ?: cid
                 if (cleaned.isNotEmpty() && cleaned.startsWith("http")) {
                     liveUrls[cid] = cleaned
-                    val name = CHANNELS.find { it.id == cid }?.name ?: cid
                     LogManager.log("[$name] 抓取成功: ${cleaned.take(45)}...")
                 } else {
+                    if (attempts % 4 == 0) {
+                        LogManager.log("[$name] 正在解析播放流 (尝试 $attempts/20)...")
+                    }
                     scheduleCheck(cid, attempts + 1)
                 }
             }
-        }, 3000)
+        }, 2000)
     }
 
     private fun schedulePeriodicReload() {
         mainHandler.postDelayed({
-            LogManager.log("执行 20 分钟定时续期...")
+            LogManager.log("执行 20 分钟定时换新续期...")
             for ((_, wv) in webViewMap) {
                 wv.reload()
             }
@@ -176,7 +223,7 @@ class LocalProxyServer(port: Int) : NanoHTTPD(port) {
                     }
                     val req = Request.Builder().url(upstreamUrl)
                         .header("Referer", referer)
-                        .header("User-Agent", "Mozilla/5.0")
+                        .header("User-Agent", PC_UA)
                         .build()
                     val resp = client.newCall(req).execute()
                     val bytes = resp.body?.bytes() ?: ByteArray(0)
@@ -187,13 +234,13 @@ class LocalProxyServer(port: Int) : NanoHTTPD(port) {
                     val cid = uri.removePrefix("/").removeSuffix(".m3u8")
                     val liveUrl = WebViewKeeper.getUrl(cid)
                     if (liveUrl.isNullOrEmpty()) {
-                        LogManager.log("[$cid] 尚未就绪，重试中")
+                        LogManager.log("[$cid] 尚未就绪，重试中...")
                         return newFixedLengthResponse(Response.Status.SERVICE_UNAVAILABLE, "text/plain", "Stream not ready yet")
                     }
 
                     val req = Request.Builder().url(liveUrl)
                         .header("Referer", referer)
-                        .header("User-Agent", "Mozilla/5.0")
+                        .header("User-Agent", PC_UA)
                         .build()
                     val resp = client.newCall(req).execute()
                     val rawM3u8 = resp.body?.string() ?: ""
@@ -221,7 +268,7 @@ class LocalProxyServer(port: Int) : NanoHTTPD(port) {
 }
 
 // ==========================================
-// 5. 后台前台保活服务 (修复通知图标与闪退)
+// 5. 后台前台保活服务
 // ==========================================
 class BridgeService : Service() {
 
@@ -247,7 +294,6 @@ class BridgeService : Service() {
                 val manager = getSystemService(Context.NOTIFICATION_SERVICE) as NotificationManager
                 manager.createNotificationChannel(chan)
             }
-            // 使用系统原生内置小图标 android.R.drawable.stat_notify_sync，100% 不会报非法图标崩溃
             val notification = NotificationCompat.Builder(this, channelId)
                 .setContentTitle("长江云直播助手运行中")
                 .setContentText("127.0.0.1:8899 正在中继")
@@ -285,9 +331,11 @@ class MainActivity : AppCompatActivity() {
             setContentView(R.layout.activity_main)
 
             val btnToggle = findViewById<Button>(R.id.btnToggle)
+            val btnCopy = findViewById<Button>(R.id.btnCopy)
             val btnClear = findViewById<Button>(R.id.btnClear)
             val tvLogs = findViewById<TextView>(R.id.tvLogs)
             val scrollView = findViewById<ScrollView>(R.id.scrollView)
+            val hiddenContainer = findViewById<ViewGroup>(R.id.hiddenWebContainer)
 
             LogManager.onLogListener = {
                 runOnUiThread {
@@ -308,17 +356,27 @@ class MainActivity : AppCompatActivity() {
                         btnToggle.text = "停止服务"
                         btnToggle.setBackgroundColor(0xFFD32F2F.toInt())
                         isRunning = true
-                        LogManager.log("指令发送: 启动后台服务...")
+                        LogManager.log("正在唤醒 6 个后台标签页并抓流...")
+                        // 挂载到当前主界面以激活硬件加速渲染
+                        WebViewKeeper.init(this, hiddenContainer)
                     } else {
                         stopService(intent)
                         btnToggle.text = "启动服务"
                         btnToggle.setBackgroundColor(0xFF2196F3.toInt())
                         isRunning = false
-                        LogManager.log("指令发送: 停止后台服务")
+                        LogManager.log("服务已停止")
                     }
                 } catch (e: Throwable) {
                     LogManager.log("启动服务捕获错误: ${e.message}")
                 }
+            }
+
+            // 一键复制全部日志
+            btnCopy.setOnClickListener {
+                val clipboard = getSystemService(Context.CLIPBOARD_SERVICE) as ClipboardManager
+                val clip = ClipData.newPlainText("Logs", LogManager.getAllLogs())
+                clipboard.setPrimaryClip(clip)
+                Toast.makeText(this, "日志已复制到剪贴板", Toast.LENGTH_SHORT).show()
             }
 
             btnClear.setOnClickListener {
@@ -326,7 +384,7 @@ class MainActivity : AppCompatActivity() {
                 tvLogs.text = ""
             }
 
-            LogManager.log("软件就绪，点击【启动服务】。")
+            LogManager.log("软件就绪，点击【启动服务】开始。")
 
         } catch (e: Throwable) {
             AlertDialog.Builder(this)
