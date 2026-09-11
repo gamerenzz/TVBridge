@@ -76,25 +76,29 @@ object WebViewKeeper {
 
     fun init(context: Context) {
         mainHandler.post {
-            for (ch in CHANNELS) {
-                if (webViewMap.containsKey(ch.id)) continue
-                val wv = WebView(context.applicationContext).apply {
-                    settings.javaScriptEnabled = true
-                    settings.domStorageEnabled = true
-                    settings.mediaPlaybackRequiresUserGesture = false
-                    settings.cacheMode = WebSettings.LOAD_NO_CACHE
+            try {
+                for (ch in CHANNELS) {
+                    if (webViewMap.containsKey(ch.id)) continue
+                    val wv = WebView(context).apply {
+                        settings.javaScriptEnabled = true
+                        settings.domStorageEnabled = true
+                        settings.mediaPlaybackRequiresUserGesture = false
+                        settings.cacheMode = WebSettings.LOAD_NO_CACHE
 
-                    webViewClient = object : WebViewClient() {
-                        override fun onPageFinished(view: WebView?, url: String?) {
-                            LogManager.log("[${ch.name}] 页面已加载，开始抓取流...")
-                            scheduleCheck(ch.id)
+                        webViewClient = object : WebViewClient() {
+                            override fun onPageFinished(view: WebView?, url: String?) {
+                                LogManager.log("[${ch.name}] 页面已加载，开始抓流...")
+                                scheduleCheck(ch.id)
+                            }
                         }
+                        loadUrl("https://news.hbtv.com.cn/app/tv/${ch.id}")
                     }
-                    loadUrl("https://news.hbtv.com.cn/app/tv/${ch.id}")
+                    webViewMap[ch.id] = wv
                 }
-                webViewMap[ch.id] = wv
+                schedulePeriodicReload()
+            } catch (e: Exception) {
+                LogManager.log("WebView初始化异常: ${e.message}")
             }
-            schedulePeriodicReload()
         }
     }
 
@@ -108,7 +112,7 @@ object WebViewKeeper {
                 if (cleaned.isNotEmpty() && cleaned.startsWith("http")) {
                     liveUrls[cid] = cleaned
                     val name = CHANNELS.find { it.id == cid }?.name ?: cid
-                    LogManager.log("[$name] 成功获取地址: ${cleaned.take(45)}...")
+                    LogManager.log("[$name] 抓取成功: ${cleaned.take(45)}...")
                 } else {
                     scheduleCheck(cid, attempts + 1)
                 }
@@ -118,7 +122,7 @@ object WebViewKeeper {
 
     private fun schedulePeriodicReload() {
         mainHandler.postDelayed({
-            LogManager.log("定时任务: 执行 20 分钟换新续期...")
+            LogManager.log("执行 20 分钟定时续期...")
             for ((_, wv) in webViewMap) {
                 wv.reload()
             }
@@ -156,7 +160,6 @@ class LocalProxyServer(port: Int) : NanoHTTPD(port) {
 
         return try {
             when {
-                // 播放列表接口
                 uri == "/live.m3u" || uri == "/" -> {
                     val m3u = StringBuilder("#EXTM3U\n")
                     for (ch in CHANNELS) {
@@ -166,7 +169,6 @@ class LocalProxyServer(port: Int) : NanoHTTPD(port) {
                     newFixedLengthResponse(Response.Status.OK, "application/vnd.apple.mpegurl", m3u.toString())
                 }
 
-                // TS 分片中继
                 uri == "/ts" -> {
                     val upstreamUrl = params["u"]?.firstOrNull() ?: return newFixedLengthResponse(Response.Status.BAD_REQUEST, "text/plain", "Missing u")
                     if (!tsPattern.matcher(upstreamUrl).find()) {
@@ -181,12 +183,11 @@ class LocalProxyServer(port: Int) : NanoHTTPD(port) {
                     newFixedLengthResponse(Response.Status.OK, "video/mp2t", ByteArrayInputStream(bytes), bytes.size.toLong())
                 }
 
-                // M3U8 列表转发与重写
                 uri.endsWith(".m3u8") -> {
                     val cid = uri.removePrefix("/").removeSuffix(".m3u8")
                     val liveUrl = WebViewKeeper.getUrl(cid)
                     if (liveUrl.isNullOrEmpty()) {
-                        LogManager.log("[$cid] 尚未就绪或地址获取中")
+                        LogManager.log("[$cid] 尚未就绪，重试中")
                         return newFixedLengthResponse(Response.Status.SERVICE_UNAVAILABLE, "text/plain", "Stream not ready yet")
                     }
 
@@ -213,14 +214,14 @@ class LocalProxyServer(port: Int) : NanoHTTPD(port) {
                 else -> newFixedLengthResponse(Response.Status.NOT_FOUND, "text/plain", "Not Found")
             }
         } catch (e: Exception) {
-            LogManager.log("代理处理异常: ${e.message}")
+            LogManager.log("代理请求异常: ${e.message}")
             newFixedLengthResponse(Response.Status.INTERNAL_ERROR, "text/plain", e.message)
         }
     }
 }
 
 // ==========================================
-// 5. 后台前台保活服务
+// 5. 后台前台保活服务 (修复通知图标与闪退)
 // ==========================================
 class BridgeService : Service() {
 
@@ -228,29 +229,36 @@ class BridgeService : Service() {
 
     override fun onCreate() {
         super.onCreate()
-        startForegroundNotification()
         try {
+            startForegroundNotification()
             server = LocalProxyServer(8899).apply { start() }
             LogManager.log("本地中继服务已在 127.0.0.1:8899 启动")
-        } catch (e: Exception) {
-            LogManager.log("启动 8899 端口失败: ${e.message}")
+            WebViewKeeper.init(this)
+        } catch (e: Throwable) {
+            LogManager.log("Service启动异常: ${e.message}")
         }
-        WebViewKeeper.init(this)
     }
 
     private fun startForegroundNotification() {
-        val channelId = "hbtv_bridge_service"
-        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
-            val chan = NotificationChannel(channelId, "HBTV直播服务", NotificationManager.IMPORTANCE_LOW)
-            val manager = getSystemService(Context.NOTIFICATION_SERVICE) as NotificationManager
-            manager.createNotificationChannel(chan)
+        try {
+            val channelId = "hbtv_bridge_service"
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+                val chan = NotificationChannel(channelId, "HBTV直播服务", NotificationManager.IMPORTANCE_LOW)
+                val manager = getSystemService(Context.NOTIFICATION_SERVICE) as NotificationManager
+                manager.createNotificationChannel(chan)
+            }
+            // 使用系统原生内置小图标 android.R.drawable.stat_notify_sync，100% 不会报非法图标崩溃
+            val notification = NotificationCompat.Builder(this, channelId)
+                .setContentTitle("长江云直播助手运行中")
+                .setContentText("127.0.0.1:8899 正在中继")
+                .setSmallIcon(android.R.drawable.stat_notify_sync)
+                .setPriority(NotificationCompat.PRIORITY_LOW)
+                .build()
+
+            startForeground(1, notification)
+        } catch (e: Throwable) {
+            LogManager.log("通知栏初始化警告: ${e.message}")
         }
-        val notification = NotificationCompat.Builder(this, channelId)
-            .setContentTitle("长江云直播助手运行中")
-            .setContentText("端口: 8899 正在中继")
-            .setSmallIcon(R.drawable.ic_launcher)
-            .build()
-        startForeground(1, notification)
     }
 
     override fun onDestroy() {
@@ -264,26 +272,13 @@ class BridgeService : Service() {
 }
 
 // ==========================================
-// 6. 主界面 (带闪退保护与日志滚动)
+// 6. 主界面
 // ==========================================
 class MainActivity : AppCompatActivity() {
 
     private var isRunning = false
 
     override fun onCreate(savedInstanceState: Bundle?) {
-        // 注册全局异常捕获
-        Thread.setDefaultUncaughtExceptionHandler { _, throwable ->
-            runOnUiThread {
-                try {
-                    AlertDialog.Builder(this)
-                        .setTitle("软件启动/运行异常")
-                        .setMessage(throwable.stackTraceToString())
-                        .setPositiveButton("确定", null)
-                        .show()
-                } catch (_: Exception) {}
-            }
-        }
-
         super.onCreate(savedInstanceState)
 
         try {
@@ -303,21 +298,26 @@ class MainActivity : AppCompatActivity() {
 
             btnToggle.setOnClickListener {
                 val intent = Intent(this, BridgeService::class.java)
-                if (!isRunning) {
-                    if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
-                        startForegroundService(intent)
+                try {
+                    if (!isRunning) {
+                        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+                            startForegroundService(intent)
+                        } else {
+                            startService(intent)
+                        }
+                        btnToggle.text = "停止服务"
+                        btnToggle.setBackgroundColor(0xFFD32F2F.toInt())
+                        isRunning = true
+                        LogManager.log("指令发送: 启动后台服务...")
                     } else {
-                        startService(intent)
+                        stopService(intent)
+                        btnToggle.text = "启动服务"
+                        btnToggle.setBackgroundColor(0xFF2196F3.toInt())
+                        isRunning = false
+                        LogManager.log("指令发送: 停止后台服务")
                     }
-                    btnToggle.text = "停止服务"
-                    btnToggle.setBackgroundColor(0xFFD32F2F.toInt())
-                    isRunning = true
-                    LogManager.log("正在唤醒 6 个后台标签页并启动服务...")
-                } else {
-                    stopService(intent)
-                    btnToggle.text = "启动服务"
-                    btnToggle.setBackgroundColor(0xFF2196F3.toInt())
-                    isRunning = false
+                } catch (e: Throwable) {
+                    LogManager.log("启动服务捕获错误: ${e.message}")
                 }
             }
 
@@ -326,13 +326,13 @@ class MainActivity : AppCompatActivity() {
                 tvLogs.text = ""
             }
 
-            LogManager.log("长江云直播助手就绪，点击【启动服务】即可开始。")
+            LogManager.log("软件就绪，点击【启动服务】。")
 
         } catch (e: Throwable) {
             AlertDialog.Builder(this)
-                .setTitle("界面初始化失败")
+                .setTitle("界面报错")
                 .setMessage(e.stackTraceToString())
-                .setPositiveButton("退出", null)
+                .setPositiveButton("确定", null)
                 .show()
         }
     }
