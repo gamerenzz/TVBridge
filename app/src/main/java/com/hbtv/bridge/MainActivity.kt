@@ -1,7 +1,12 @@
 package com.hbtv.bridge
 
 import android.annotation.SuppressLint
+import android.content.ClipData
+import android.content.ClipboardManager
+import android.content.Context
 import android.content.Intent
+import android.graphics.Bitmap
+import android.net.wifi.WifiManager
 import android.os.Build
 import android.os.Bundle
 import android.view.KeyEvent
@@ -12,6 +17,7 @@ import android.webkit.*
 import android.widget.Button
 import android.widget.ScrollView
 import android.widget.TextView
+import android.widget.Toast
 import androidx.appcompat.app.AppCompatActivity
 import androidx.recyclerview.widget.LinearLayoutManager
 import androidx.recyclerview.widget.RecyclerView
@@ -19,6 +25,8 @@ import okhttp3.*
 import okhttp3.MediaType.Companion.toMediaType
 import okhttp3.RequestBody.Companion.toRequestBody
 import org.json.JSONObject
+import java.net.Inet4Address
+import java.net.NetworkInterface
 import java.text.SimpleDateFormat
 import java.util.*
 import java.util.concurrent.CopyOnWriteArrayList
@@ -71,7 +79,6 @@ class MainActivity : AppCompatActivity() {
     private lateinit var adapter: ChannelAdapter
     private var currentChannelIndex = 0
 
-    // 持久单调递增计数器
     private val seqCounter = AtomicLong(System.currentTimeMillis() / 1000)
 
     private val httpClient = OkHttpClient.Builder()
@@ -98,12 +105,31 @@ class MainActivity : AppCompatActivity() {
 
         val btnToggleDrawer = findViewById<Button>(R.id.btnToggleDrawer)
         val btnToggleLogs = findViewById<Button>(R.id.btnToggleLogs)
+        val btnCopyM3u = findViewById<Button>(R.id.btnCopyM3u)
+        val btnMinimize = findViewById<Button>(R.id.btnMinimize)
         val btnClearLogs = findViewById<TextView>(R.id.btnClearLogs)
         val btnCloseLogs = findViewById<TextView>(R.id.btnCloseLogs)
 
         val tabCctv = findViewById<Button>(R.id.tabCctv)
         val tabSatellite = findViewById<Button>(R.id.tabSatellite)
         val tabLocal = findViewById<Button>(R.id.tabLocal)
+
+        // 1. 一键复制 M3U 订阅源功能 (自动获取局域网与本机 IP)
+        btnCopyM3u.setOnClickListener {
+            val ip = getDeviceIpAddress()
+            val m3uUrl = "http://$ip:18888/live.m3u"
+            val clipboard = getSystemService(Context.CLIPBOARD_SERVICE) as ClipboardManager
+            val clip = ClipData.newPlainText("IPTV_M3U", m3uUrl)
+            clipboard.setPrimaryClip(clip)
+            Toast.makeText(this, "已复制订阅源:\n$m3uUrl", Toast.LENGTH_LONG).show()
+            LogManager.log("已复制订阅源地址: $m3uUrl")
+        }
+
+        // 2. 最小化后台运行支持
+        btnMinimize.setOnClickListener {
+            Toast.makeText(this, "掌上电视已转入后台运行，服务不间断", Toast.LENGTH_SHORT).show()
+            moveTaskToBack(true)
+        }
 
         LogManager.onLogListener = {
             runOnUiThread {
@@ -162,6 +188,9 @@ class MainActivity : AppCompatActivity() {
 
     @SuppressLint("SetJavaScriptEnabled")
     private fun initPlayerWebView() {
+        // 开启硬件渲染层
+        playerWebView.setLayerType(View.LAYER_TYPE_HARDWARE, null)
+
         playerWebView.settings.apply {
             javaScriptEnabled = true
             domStorageEnabled = true
@@ -170,6 +199,8 @@ class MainActivity : AppCompatActivity() {
             mixedContentMode = WebSettings.MIXED_CONTENT_ALWAYS_ALLOW
             userAgentString = AuthSigner.Ua
             cacheMode = WebSettings.LOAD_NO_CACHE
+            useWideViewPort = true
+            loadWithOverviewMode = true
         }
 
         playerWebView.webChromeClient = object : WebChromeClient() {
@@ -178,6 +209,11 @@ class MainActivity : AppCompatActivity() {
                     LogManager.log("[JS] ${it.message()}")
                 }
                 return true
+            }
+
+            // 彻底去除 Chromium 默认自带的巨大黑色三角形海报
+            override fun getDefaultVideoPoster(): Bitmap {
+                return Bitmap.createBitmap(1, 1, Bitmap.Config.ARGB_8888)
             }
         }
 
@@ -222,7 +258,9 @@ class MainActivity : AppCompatActivity() {
                         }
                     """.trimIndent()
                     playerWebView.evaluateJavascript(polyfill, null)
-                    playChannel(ChannelRepository.channels.first())
+                    
+                    // 【关键改动1】：默认不自动播放任何频道，静候用户在抽屉中手动选台
+                    tvCurrentPlaying.text = "掌上电视已就绪 · 请选台"
                 }
             }
 
@@ -246,7 +284,7 @@ class MainActivity : AppCompatActivity() {
 
     private fun playChannel(ch: TvChannel) {
         tvCurrentPlaying.text = "${ch.name} (鉴权取流中...)"
-        LogManager.log("▶ 开始取流: ${ch.name} (pid=${ch.pid})")
+        LogManager.log("▶ 手动换台: ${ch.name} (pid=${ch.pid})")
 
         if (ch.group == ChannelGroup.LOCAL) {
             val localM3u8 = "http://127.0.0.1:18888/hbtv/${ch.id}.m3u8"
@@ -389,12 +427,11 @@ class MainActivity : AppCompatActivity() {
         val yspsdkinput = AuthSigner.computeLiveSdkInput(liveFields)
         val bodySig = AuthSigner.computeLiveBodySignature(liveFields)
 
-        // ★★★ 核心修复：必须单调递增生成一组【唯一定稿】的 liveSeqId 和 liveReqId ★★★
         val liveSeqId = seqCounter.incrementAndGet().toString()
         val liveTs = System.currentTimeMillis().toString()
         val liveReqId = "999999" + AuthSigner.randStr(10) + liveTs
 
-        // 6. 算 sig2（必须用 liveSeqId 和 liveReqId 算签名！）
+        // 6. 算 sig2
         LogManager.log("5. 计算 sig2 签名...")
         signatureFuture = SyncValue()
         runOnUiThread {
@@ -405,7 +442,7 @@ class MainActivity : AppCompatActivity() {
             return null
         }
 
-        // 7. POST 直连 https://player-api.yangshipin.cn/v1/player/get_live_info
+        // 7. POST /v1/player/get_live_info
         LogManager.log("6. 请求 get_live_info 获取直播流...")
         val bodyJson = JSONObject().apply {
             for ((k, v) in liveFields) {
@@ -423,9 +460,7 @@ class MainActivity : AppCompatActivity() {
             .header("yspsdksign", "$sig2-$yspsdkinput-${AuthSigner.Guid}-$liveSeqId-$liveReqId")
             .header("yspticket", yspticket)
 
-        // ★★★ 核心修复：Header 和 Cookie 必须严格使用同一套 liveSeqId 和 liveReqId！
         val liveReq = applyBrowserHeaders(liveReqBuilder, liveSeqId, liveReqId).build()
-
         val liveResp = httpClient.newCall(liveReq).execute()
         val liveRes = liveResp.body?.string() ?: ""
         LogManager.log("get_live_info 返回 [HTTP ${liveResp.code}]: ${liveRes.take(80)}...")
@@ -436,24 +471,65 @@ class MainActivity : AppCompatActivity() {
         return if (playUrl.isNotEmpty()) playUrl + ext else null
     }
 
+    // 注入全屏样式与强制自播放配置，确保视频层完全拉起
     private fun startHlsPlay(m3u8Url: String) {
         val safe = m3u8Url.replace("'", "\\'")
-        playerWebView.evaluateJavascript("window.__startM3u8('$safe');", null)
+        val js = """
+            window.__startM3u8('$safe');
+            var v = document.querySelector('video') || document.getElementById('video');
+            if (v) {
+                v.style.position = 'fixed';
+                v.style.top = '0';
+                v.style.left = '0';
+                v.style.width = '100vw';
+                v.style.height = '100vh';
+                v.style.objectFit = 'contain';
+                v.style.backgroundColor = '#000000';
+                v.setAttribute('playsinline', 'true');
+                v.setAttribute('webkit-playsinline', 'true');
+                v.play().catch(function(e){});
+            }
+        """.trimIndent()
+        playerWebView.evaluateJavascript(js, null)
     }
 
+    // 获取本机局域网 IP 地址
+    private fun getDeviceIpAddress(): String {
+        try {
+            val interfaces = NetworkInterface.getNetworkInterfaces()
+            while (interfaces.hasMoreElements()) {
+                val intf = interfaces.nextElement()
+                val addrs = intf.inetAddresses
+                while (addrs.hasMoreElements()) {
+                    val addr = addrs.nextElement()
+                    if (!addr.isLoopbackAddress && addr is Inet4Address) {
+                        return addr.hostAddress ?: "127.0.0.1"
+                    }
+                }
+            }
+        } catch (e: Exception) {
+            // ignore
+        }
+        return "127.0.0.1"
+    }
+
+    // 智能返回键控制：先关闭悬浮层，再次返回则最小化到后台保活，绝不退出服务
     override fun onKeyDown(keyCode: Int, event: KeyEvent?): Boolean {
         val currentList = getFilteredChannels()
-        if (currentList.isEmpty()) return super.onKeyDown(keyCode, event)
 
         when (keyCode) {
             KeyEvent.KEYCODE_DPAD_UP -> {
-                currentChannelIndex = (currentChannelIndex - 1 + currentList.size) % currentList.size
-                playChannel(currentList[currentChannelIndex])
+                if (currentList.isNotEmpty()) {
+                    currentChannelIndex = (currentChannelIndex - 1 + currentList.size) % currentList.size
+                    playChannel(currentList[currentChannelIndex])
+                }
                 return true
             }
             KeyEvent.KEYCODE_DPAD_DOWN -> {
-                currentChannelIndex = (currentChannelIndex + 1) % currentList.size
-                playChannel(currentList[currentChannelIndex])
+                if (currentList.isNotEmpty()) {
+                    currentChannelIndex = (currentChannelIndex + 1) % currentList.size
+                    playChannel(currentList[currentChannelIndex])
+                }
                 return true
             }
             KeyEvent.KEYCODE_DPAD_CENTER, KeyEvent.KEYCODE_ENTER -> {
@@ -469,6 +545,9 @@ class MainActivity : AppCompatActivity() {
                     channelDrawer.visibility = View.GONE
                     return true
                 }
+                // 返回键改为最小化，确保中继不被杀死
+                moveTaskToBack(true)
+                return true
             }
         }
         return super.onKeyDown(keyCode, event)
