@@ -8,11 +8,12 @@ object AuthSigner {
     const val Guid = "mra3u75l_jdrj8csvhkk"
     const val VappId = "59306155"
     const val Vsecret = "b42702bf7309a179d102f3d51b1add2fda0bc7ada64cb801"
-    const val Cookie = "guid=$Guid; versionName=99.99.99; versionCode=999999; vplatform=109; platformVersion=Chrome; deviceModel=150; newLogin=1; pc_version=1.1.16; ysp_uinfo_pc=;"
+    const val Cookie = "guid=mra3u75l_jdrj8csvhkk; versionName=99.99.99; versionCode=999999; vplatform=109; platformVersion=Chrome; deviceModel=150; newLogin=1; pc_version=1.1.16; ysp_uinfo_pc=;"
     const val Ua = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/150.0.0.0 Safari/537.36"
 
     const val AuthSalt = "n@7QKk%YeSjfw%22"
-    const val LiveSaltTc = "0f$IVHi9Qno?G"
+    // 注意：这里的 $ 前面必须加反斜杠 \$ 转义，防止被 Kotlin 当作变量插值解析
+    const val LiveSaltTc = "0f\$IVHi9Qno?G"
 
     fun randStr(len: Int): String {
         val chars = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789"
