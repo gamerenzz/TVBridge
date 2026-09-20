@@ -93,7 +93,7 @@ object CmgEngine {
         mainHandler.post {
             headLessWebView?.evaluateJavascript("window.__genTokenRnd('$guid', '$token', '$ts');", null)
         }
-        tokenRndLatch?.await(3, TimeUnit.SECONDS)
+        tokenRndLatch?.await(6, TimeUnit.SECONDS)
         return tokenRndVal
     }
 
@@ -108,11 +108,11 @@ object CmgEngine {
                 latch.countDown()
             }
         }
-        latch.await(3, TimeUnit.SECONDS)
+        latch.await(6, TimeUnit.SECONDS)
         return res
     }
 
-    // 生成 yspticket
+    // 生成 yspticket (必须使用 /auth 返回的 authTs)
     fun generateYspTicket(pid: String, authTs: String, cnlId: String): String {
         val latch = CountDownLatch(1)
         var res = ""
@@ -122,7 +122,7 @@ object CmgEngine {
                 latch.countDown()
             }
         }
-        latch.await(3, TimeUnit.SECONDS)
+        latch.await(6, TimeUnit.SECONDS)
         return res
     }
 
@@ -133,7 +133,7 @@ object CmgEngine {
         mainHandler.post {
             headLessWebView?.evaluateJavascript("window.__generateSignature('$pid','$guid','$seqId','$reqId','$sessionToken','$ts','$yspsdkinput');", null)
         }
-        sig2Latch?.await(3, TimeUnit.SECONDS)
+        sig2Latch?.await(6, TimeUnit.SECONDS)
         return sig2Val
     }
 
