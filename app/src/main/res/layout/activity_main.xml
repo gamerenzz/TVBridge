@@ -1,109 +1,122 @@
 <?xml version="1.0" encoding="utf-8"?>
-<LinearLayout xmlns:android="http://schemas.android.com/apk/res/android"
+<FrameLayout xmlns:android="http://schemas.android.com/apk/res/android"
+    xmlns:app="http://schemas.android.com/apk/res-auto"
     android:layout_width="match_parent"
     android:layout_height="match_parent"
-    android:background="#121212"
-    android:orientation="vertical"
-    android:padding="16dp">
+    android:background="#000000">
 
-    <!-- 标题 -->
-    <TextView
-        android:layout_width="wrap_content"
-        android:layout_height="wrap_content"
-        android:text="长江云直播助手 (HBTV Bridge)"
-        android:textColor="#FFFFFF"
-        android:textSize="20sp"
-        android:textStyle="bold" />
-
-    <!-- 订阅源地址显示框 -->
-    <TextView
-        android:id="@+id/tvM3uUrl"
+    <!-- 1. 全屏播放器内核 (加载 player.served.html) -->
+    <WebView
+        android:id="@+id/playerWebView"
         android:layout_width="match_parent"
-        android:layout_height="wrap_content"
-        android:layout_marginTop="10dp"
-        android:background="#1E1E1E"
-        android:padding="12dp"
-        android:text="播放列表: http://127.0.0.1:8899/live.m3u"
-        android:textColor="#4CAF50"
-        android:textIsSelectable="true"
-        android:textSize="14sp" />
+        android:layout_height="match_parent" />
 
-    <!-- 操作按钮区 (包含启动、复制日志、清空) -->
+    <!-- 2. 状态与频道标题浮层 -->
     <LinearLayout
+        android:id="@+id/topBar"
         android:layout_width="match_parent"
         android:layout_height="wrap_content"
-        android:layout_marginTop="12dp"
-        android:orientation="horizontal">
+        android:background="#B3000000"
+        android:orientation="horizontal"
+        android:padding="12dp">
 
-        <Button
-            android:id="@+id/btnToggle"
+        <TextView
+            android:id="@+id/tvCurrentPlaying"
             android:layout_width="0dp"
             android:layout_height="wrap_content"
             android:layout_weight="1"
-            android:backgroundTint="#2196F3"
-            android:focusable="true"
-            android:text="启动服务"
-            android:textColor="#FFFFFF" />
+            android:text="正在加载播放器..."
+            android:textColor="#FFFFFF"
+            android:textSize="15sp"
+            android:textStyle="bold" />
 
         <Button
-            android:id="@+id/btnCopy"
+            android:id="@+id/btnToggleDrawer"
             android:layout_width="wrap_content"
-            android:layout_height="wrap_content"
-            android:layout_marginStart="8dp"
-            android:backgroundTint="#00897B"
+            android:layout_height="36dp"
+            android:backgroundTint="#2F6BFF"
             android:focusable="true"
-            android:text="复制日志"
-            android:textColor="#FFFFFF" />
-
-        <Button
-            android:id="@+id/btnClear"
-            android:layout_width="wrap_content"
-            android:layout_height="wrap_content"
-            android:layout_marginStart="8dp"
-            android:backgroundTint="#424242"
-            android:focusable="true"
-            android:text="清空"
-            android:textColor="#FFFFFF" />
+            android:text="频道列表 ☰"
+            android:textColor="#FFFFFF"
+            android:textSize="12sp" />
     </LinearLayout>
 
-    <!-- 日志区域提示 -->
-    <TextView
-        android:layout_width="wrap_content"
-        android:layout_height="wrap_content"
-        android:layout_marginTop="14dp"
-        android:text="实时运行日志 (长按可单选/全选复制):"
-        android:textColor="#AAAAAA"
-        android:textSize="13sp" />
+    <!-- 3. 悬浮换台抽屉面板 -->
+    <LinearLayout
+        android:id="@+id/channelDrawer"
+        android:layout_width="320dp"
+        android:layout_height="match_parent"
+        android:layout_gravity="start"
+        android:background="#E61A1A2E"
+        android:orientation="vertical"
+        android:padding="12dp"
+        android:visibility="gone">
 
-    <!-- 滚动日志控制台 -->
-    <ScrollView
-        android:id="@+id/scrollView"
-        android:layout_width="match_parent"
-        android:layout_height="0dp"
-        android:layout_marginTop="8dp"
-        android:layout_weight="1"
-        android:background="#000000"
-        android:padding="8dp">
-
-        <!-- 开启文本自由单选、全选、长按划选复制 -->
         <TextView
-            android:id="@+id/tvLogs"
+            android:layout_width="wrap_content"
+            android:layout_height="wrap_content"
+            android:text="切换频道"
+            android:textColor="#FFFFFF"
+            android:textSize="18sp"
+            android:textStyle="bold" />
+
+        <!-- 分类切换 -->
+        <LinearLayout
             android:layout_width="match_parent"
             android:layout_height="wrap_content"
-            android:clickable="true"
-            android:focusable="true"
-            android:fontFamily="monospace"
-            android:longClickable="true"
-            android:textIsSelectable="true"
-            android:textColor="#00FF66"
-            android:textSize="11sp" />
-    </ScrollView>
+            android:layout_marginTop="8dp"
+            android:orientation="horizontal">
 
-    <!-- 1x1 隐藏容器，用于挂载 WebView 激活硬件加速与防休眠 -->
+            <Button
+                android:id="@+id/tabCctv"
+                style="@style/Widget.MaterialComponents.Button.TextButton"
+                android:layout_width="0dp"
+                android:layout_height="wrap_content"
+                android:layout_weight="1"
+                android:text="央视"
+                android:textColor="#2F6BFF" />
+
+            <Button
+                android:id="@+id/tabSatellite"
+                style="@style/Widget.MaterialComponents.Button.TextButton"
+                android:layout_width="0dp"
+                android:layout_height="wrap_content"
+                android:layout_weight="1"
+                android:text="卫视"
+                android:textColor="#888888" />
+
+            <Button
+                android:id="@+id/tabLocal"
+                style="@style/Widget.MaterialComponents.Button.TextButton"
+                android:layout_width="0dp"
+                android:layout_height="wrap_content"
+                android:layout_weight="1"
+                android:text="湖北"
+                android:textColor="#888888" />
+        </LinearLayout>
+
+        <!-- 频道列表 -->
+        <androidx.recyclerview.widget.RecyclerView
+            android:id="@+id/rvChannels"
+            android:layout_width="match_parent"
+            android:layout_height="0dp"
+            android:layout_weight="1"
+            android:paddingTop="8dp" />
+
+        <TextView
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:layout_marginTop="8dp"
+            android:text="订阅源: http://127.0.0.1:18888/live.m3u"
+            android:textColor="#4CAF50"
+            android:textSize="11sp" />
+    </LinearLayout>
+
+    <!-- 隐藏无头 WebView 容器 -->
     <LinearLayout
         android:id="@+id/hiddenWebContainer"
         android:layout_width="1dp"
         android:layout_height="1dp"
-        android:visibility="invisible"
-        android:orientation="vertical" />
-</LinearLayout>
+        android:orientation="vertical"
+        android:visibility="invisible" />
+</FrameLayout>
