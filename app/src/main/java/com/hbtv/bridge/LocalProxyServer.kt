@@ -33,7 +33,6 @@ class LocalProxyServer(private val context: Context, port: Int = 18888) : NanoHT
     private val tsPattern = Pattern.compile("^https://live\\d+-cjy\\.hbtv\\.com\\.cn/")
 
     private val upstreamM3u8Cache = ConcurrentHashMap<String, Pair<String, Long>>()
-    // ★ 按频道 PID 独立缓存 Token，杜绝串台导致 401
     private val tokenCacheByPid = ConcurrentHashMap<String, ChannelTokens>()
 
     override fun serve(session: IHTTPSession): Response {
@@ -109,7 +108,7 @@ class LocalProxyServer(private val context: Context, port: Int = 18888) : NanoHT
                     newFixedLengthResponse(Response.Status.OK, "application/vnd.apple.mpegurl", rewrittenM3u8)
                 }
 
-                // 4. 央视/卫视分片中继
+                // 4. 央视/卫视分片中继与解密分流
                 uri == "/cctv/seg" -> {
                     val upstreamUrl = params["u"]?.firstOrNull()
                         ?: return newFixedLengthResponse(Response.Status.BAD_REQUEST, "text/plain", "Missing u")
@@ -121,10 +120,17 @@ class LocalProxyServer(private val context: Context, port: Int = 18888) : NanoHT
                     val resp = client.newCall(req).execute()
                     val rawBytes = resp.body?.bytes() ?: ByteArray(0)
 
-                    val isCctv6 = upstreamUrl.contains("mobilelive") || upstreamUrl.contains("m3u8_with_time_tag")
-                    val clearBytes = if (isCctv6) rawBytes else CmgEngine.decryptTsInPlace(rawBytes)
+                    // 区分明文流与加密流
+                    val isClearStream = upstreamUrl.contains("mobilelive") || upstreamUrl.contains("m3u8_with_time_tag")
+                    
+                    val outputBytes = if (isClearStream) {
+                        rawBytes // CCTV-6 明文直接出流
+                    } else {
+                        // CMG 加密流送入引擎还原
+                        CmgEngine.decryptTsInPlace(rawBytes)
+                    }
 
-                    newFixedLengthResponse(Response.Status.OK, "video/mp2t", ByteArrayInputStream(clearBytes), clearBytes.size.toLong())
+                    newFixedLengthResponse(Response.Status.OK, "video/mp2t", ByteArrayInputStream(outputBytes), outputBytes.size.toLong())
                 }
 
                 // 5. 湖北台分片中继
@@ -148,7 +154,6 @@ class LocalProxyServer(private val context: Context, port: Int = 18888) : NanoHT
         }
     }
 
-    // 按当前频道 PID 精准拉取专属 Token
     private fun getTokensForChannel(ch: TvChannel): ChannelTokens? {
         val now = System.currentTimeMillis()
         val cached = tokenCacheByPid[ch.pid]
@@ -163,7 +168,6 @@ class LocalProxyServer(private val context: Context, port: Int = 18888) : NanoHT
             val ts = now.toString()
             val reqId = "999999" + AuthSigner.randStr(10) + ts
 
-            // 1. /auth (必须传入当前频道的 ch.pid)
             val authBody = "pid=${ch.pid}&guid=${AuthSigner.Guid}&appid=ysp_pc&rand_str=$randStr&signature=$authSig"
             val authReq = applyBrowserHeaders(
                 Request.Builder().url("https://player-api.yangshipin.cn/v1/player/auth")
@@ -182,7 +186,6 @@ class LocalProxyServer(private val context: Context, port: Int = 18888) : NanoHT
             val token = authJson.optJSONObject("data")?.optString("token") ?: return null
             val authTs = authJson.optJSONObject("data")?.optString("ts") ?: (now / 1000).toString()
 
-            // 2. /open-token
             val rndVal = CmgEngine.genTokenRnd(AuthSigner.Guid, token, ts)
             if (rndVal.isEmpty()) {
                 LogManager.log("[openToken] tokenRnd 计算超时")
