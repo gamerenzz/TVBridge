@@ -2,14 +2,16 @@ package com.hbtv.bridge
 
 import android.content.Context
 import fi.iki.elonen.NanoHTTPD
+import okhttp3.*
 import okhttp3.MediaType.Companion.toMediaType
-import okhttp3.OkHttpClient
-import okhttp3.Request
 import okhttp3.RequestBody.Companion.toRequestBody
+import org.json.JSONObject
 import java.io.ByteArrayInputStream
 import java.io.InputStream
 import java.net.URLEncoder
+import java.util.concurrent.ConcurrentHashMap
 import java.util.concurrent.TimeUnit
+import java.util.concurrent.atomic.AtomicLong
 import java.util.regex.Pattern
 
 class LocalProxyServer(private val context: Context, port: Int = 18888) : NanoHTTPD(port) {
@@ -19,77 +21,104 @@ class LocalProxyServer(private val context: Context, port: Int = 18888) : NanoHT
         .readTimeout(20, TimeUnit.SECONDS)
         .build()
 
+    private val seqCounter = AtomicLong(System.currentTimeMillis() / 1000)
     private val hbtvReferer = "https://news.hbtv.com.cn/"
     private val tsPattern = Pattern.compile("^https://live\\d+-cjy\\.hbtv\\.com\\.cn/")
 
+    // 缓存上游拿到的真实 m3u8（避免外部播放器频繁刷新 playlist 重复触发鉴权）
+    private val upstreamM3u8Cache = ConcurrentHashMap<String, Pair<String, Long>>()
+
     override fun serve(session: IHTTPSession): Response {
         val uri = session.uri
-        val method = session.method
         val params = session.parameters
+        val hostHeader = session.headers["host"] ?: "127.0.0.1:18888"
+        val baseUrl = "http://$hostHeader"
 
         return try {
             when {
-                // 1. 播放主页面
-                uri == "/" || uri == "/player" -> {
-                    serveAsset("player.served.html", "text/html; charset=utf-8")
-                }
-
-                // 2. 静态解密资产文件托管
-                uri.startsWith("/sapi/") -> {
-                    val filename = uri.removePrefix("/sapi/")
-                    val assetPath = "sapi_cache/$filename"
-                    val mime = if (filename.endsWith(".js")) "application/javascript" else "application/octet-stream"
-                    serveAsset(assetPath, mime)
-                }
-
-                // 3. /auth 鉴权代理 (防止 form-urlencoded 丢失 body)
-                uri == "/auth" && method == Method.POST -> {
-                    var postData = ""
-                    try {
-                        val map = HashMap<String, String>()
-                        session.parseBody(map)
-                        postData = map["postData"] ?: ""
-                    } catch (e: Exception) {}
-
-                    if (postData.isEmpty() && session.parameters.isNotEmpty()) {
-                        postData = session.parameters.map { (k, v) ->
-                            "${URLEncoder.encode(k, "UTF-8")}=${URLEncoder.encode(v.firstOrNull() ?: "", "UTF-8")}"
-                        }.joinToString("&")
+                // 1. 动态生成 IPTV M3U 播放列表 (包含 61+ 全量频道，支持分类)
+                uri == "/live.m3u" || uri == "/" -> {
+                    val m3u = StringBuilder("#EXTM3U\n")
+                    for (ch in ChannelRepository.channels) {
+                        m3u.append("#EXTINF:-1 group-title=\"${ch.group.title}\",${ch.name}\n")
+                        m3u.append("$baseUrl/play/${ch.id}.m3u8\n")
                     }
-                    proxyPost("https://player-api.yangshipin.cn/v1/player/auth", postData, "application/x-www-form-urlencoded")
+                    newFixedLengthResponse(Response.Status.OK, "application/vnd.apple.mpegurl", m3u.toString())
                 }
 
-                // 4. /open-token 代理
-                uri == "/open-token" && method == Method.GET -> {
-                    val query = session.queryParameterString ?: ""
-                    proxyGet("https://h5access.yangshipin.cn/web/open/token?$query")
+                // 2. 被动按需触发取流：当 TiviMate 请求 /play/{cid}.m3u8 时，后台自动调度
+                uri.startsWith("/play/") && uri.endsWith(".m3u8") -> {
+                    val cid = uri.removePrefix("/play/").removeSuffix(".m3u8")
+                    val ch = ChannelRepository.channels.find { it.id == cid }
+                        ?: return newFixedLengthResponse(Response.Status.NOT_FOUND, "text/plain", "Channel not found")
+
+                    LogManager.log("[中继网关] 外部播放器请求频道: ${ch.name}")
+
+                    val upstreamM3u8Url = if (ch.group == ChannelGroup.LOCAL) {
+                        // 湖北台流地址
+                        WebViewKeeper.getUrl(ch.id)
+                    } else {
+                        // 央视/卫视后台自动鉴权取流
+                        resolveCctvStreamOnDemand(ch)
+                    }
+
+                    if (upstreamM3u8Url.isNullOrEmpty()) {
+                        return newFixedLengthResponse(Response.Status.SERVICE_UNAVAILABLE, "text/plain", "Stream resolving...")
+                    }
+
+                    // 拉取上游原始 m3u8，改写分片路径为本地解密中继接口
+                    val reqBuilder = Request.Builder().url(upstreamM3u8Url).header("User-Agent", AuthSigner.Ua)
+                    if (ch.group == ChannelGroup.LOCAL) {
+                        reqBuilder.header("Referer", hbtvReferer)
+                    }
+                    val resp = client.newCall(reqBuilder.build()).execute()
+                    val rawM3u8 = resp.body?.string() ?: ""
+
+                    val upstreamBase = upstreamM3u8Url.substringBeforeLast("/") + "/"
+                    val isLocalChan = (ch.group == ChannelGroup.LOCAL)
+
+                    // 改写切片地址给 TiviMate
+                    val rewrittenM3u8 = rawM3u8.lines().joinToString("\n") { line ->
+                        val trimmed = line.trim()
+                        if (trimmed.isNotEmpty() && !trimmed.startsWith("#")) {
+                            val absoluteTs = if (trimmed.startsWith("http")) trimmed else upstreamBase + trimmed
+                            val segRoute = if (isLocalChan) "/hbtv/ts" else "/cctv/seg"
+                            "$baseUrl$segRoute?u=" + URLEncoder.encode(absoluteTs, "UTF-8")
+                        } else {
+                            line
+                        }
+                    }
+                    newFixedLengthResponse(Response.Status.OK, "application/vnd.apple.mpegurl", rewrittenM3u8)
                 }
 
-                // 5. /get-live-info 代理
-                uri == "/get-live-info" && method == Method.POST -> {
-                    var postData = ""
-                    try {
-                        val map = HashMap<String, String>()
-                        session.parseBody(map)
-                        postData = map["postData"] ?: ""
-                    } catch (e: Exception) {}
+                // 3. 央视/卫视分片下载并调用 Native 引擎原地解密
+                uri == "/cctv/seg" -> {
+                    val upstreamUrl = params["u"]?.firstOrNull()
+                        ?: return newFixedLengthResponse(Response.Status.BAD_REQUEST, "text/plain", "Missing u")
 
-                    proxyPostWithHeaders("https://player-api.yangshipin.cn/v1/player/get_live_info", postData, session.headers)
+                    val req = Request.Builder().url(upstreamUrl)
+                        .header("User-Agent", AuthSigner.Ua)
+                        .header("Referer", "https://yangshipin.cn/")
+                        .build()
+                    val resp = client.newCall(req).execute()
+                    val rawBytes = resp.body?.bytes() ?: ByteArray(0)
+
+                    // 判断是否为无需解密的 CCTV-6
+                    val isCctv6 = upstreamUrl.contains("mobilelive") || upstreamUrl.contains("m3u8_with_time_tag")
+                    val clearBytes = if (isCctv6) {
+                        rawBytes
+                    } else {
+                        // 调用 CmgEngine 进行切片原地解密，还原明文 TS
+                        CmgEngine.decryptTsInPlace(rawBytes)
+                    }
+
+                    newFixedLengthResponse(Response.Status.OK, "video/mp2t", ByteArrayInputStream(clearBytes), clearBytes.size.toLong())
                 }
 
-                // 6. EPG 节目单反向代理
-                uri.startsWith("/capi/") -> {
-                    val targetUrl = "https://capi.yangshipin.cn" + uri.removePrefix("/capi")
-                    proxyGet(targetUrl)
-                }
-
-                // 7. 湖北台 TS 分片代理
+                // 4. 湖北台 TS 伪造 Referer 转发
                 uri == "/hbtv/ts" -> {
                     val upstreamUrl = params["u"]?.firstOrNull()
                         ?: return newFixedLengthResponse(Response.Status.BAD_REQUEST, "text/plain", "Missing u")
-                    if (!tsPattern.matcher(upstreamUrl).find()) {
-                        return newFixedLengthResponse(Response.Status.FORBIDDEN, "text/plain", "Bad host")
-                    }
                     val req = Request.Builder().url(upstreamUrl)
                         .header("Referer", hbtvReferer)
                         .header("User-Agent", PC_UA)
@@ -99,118 +128,109 @@ class LocalProxyServer(private val context: Context, port: Int = 18888) : NanoHT
                     newFixedLengthResponse(Response.Status.OK, "video/mp2t", ByteArrayInputStream(bytes), bytes.size.toLong())
                 }
 
-                // 8. 湖北台 M3U8 列表动态改写
-                uri.startsWith("/hbtv/") && uri.endsWith(".m3u8") -> {
-                    val cid = uri.removePrefix("/hbtv/").removeSuffix(".m3u8")
-                    val liveUrl = WebViewKeeper.getUrl(cid)
-                    if (liveUrl.isNullOrEmpty()) {
-                        return newFixedLengthResponse(Response.Status.SERVICE_UNAVAILABLE, "text/plain", "Stream not ready yet")
-                    }
-                    val req = Request.Builder().url(liveUrl)
-                        .header("Referer", hbtvReferer)
-                        .header("User-Agent", PC_UA)
-                        .build()
-                    val resp = client.newCall(req).execute()
-                    val rawM3u8 = resp.body?.string() ?: ""
-                    val baseUrl = liveUrl.substringBeforeLast("/") + "/"
-                    val modifiedM3u8 = rawM3u8.lines().joinToString("\n") { line ->
-                        val trimmed = line.trim()
-                        if (trimmed.isNotEmpty() && !trimmed.startsWith("#")) {
-                            val absoluteTs = if (trimmed.startsWith("http")) trimmed else baseUrl + trimmed
-                            "http://127.0.0.1:18888/hbtv/ts?u=" + URLEncoder.encode(absoluteTs, "UTF-8")
-                        } else {
-                            line
-                        }
-                    }
-                    newFixedLengthResponse(Response.Status.OK, "application/vnd.apple.mpegurl", modifiedM3u8)
-                }
-
-                // 9. 导出给第三方 IPTV 播放器的标准 M3U 订阅源
-                uri == "/live.m3u" -> {
-                    val m3u = StringBuilder("#EXTM3U\n")
-                    for (ch in ChannelRepository.channels) {
-                        m3u.append("#EXTINF:-1 group-title=\"${ch.group.title}\",${ch.name}\n")
-                        if (ch.group == ChannelGroup.LOCAL) {
-                            m3u.append("http://127.0.0.1:18888/hbtv/${ch.id}.m3u8\n")
-                        } else {
-                            m3u.append("http://127.0.0.1:18888/play/${ch.id}\n")
-                        }
-                    }
-                    newFixedLengthResponse(Response.Status.OK, "application/vnd.apple.mpegurl", m3u.toString())
-                }
-
                 else -> newFixedLengthResponse(Response.Status.NOT_FOUND, "text/plain", "Not Found")
             }
         } catch (e: Exception) {
-            LogManager.log("代理异常: ${e.message}")
+            LogManager.log("[中继异常] ${e.message}")
             newFixedLengthResponse(Response.Status.INTERNAL_ERROR, "text/plain", e.message)
         }
     }
 
-    private fun serveAsset(assetPath: String, mime: String): Response {
+    // 后台被动触发全流程鉴权 (纯后台无头执行)
+    private fun resolveCctvStreamOnDemand(ch: TvChannel): String? {
+        val cacheEntry = upstreamM3u8Cache[ch.id]
+        val now = System.currentTimeMillis()
+        if (cacheEntry != null && now - cacheEntry.second < 60000) {
+            return cacheEntry.first // 60秒缓存直接命中
+        }
+
         return try {
-            val isStream: InputStream = context.assets.open(assetPath)
-            val resp = newChunkedResponse(Response.Status.OK, mime, isStream)
-            resp.addHeader("Access-Control-Allow-Origin", "*")
-            resp.addHeader("Cache-Control", "no-store")
-            resp
-        } catch (e: Exception) {
-            newFixedLengthResponse(Response.Status.NOT_FOUND, "text/plain", "Asset not found: $assetPath")
-        }
-    }
+            val randStr = AuthSigner.randStr(10)
+            val authSig = AuthSigner.computeAuthSignature(ch.pid, AuthSigner.Guid, randStr)
+            val seqId = seqCounter.incrementAndGet().toString()
+            val ts = now.toString()
+            val reqId = "999999" + AuthSigner.randStr(10) + ts
 
-    private fun makeStatus(code: Int, desc: String): Response.IStatus {
-        return object : Response.IStatus {
-            override fun getRequestStatus(): Int = code
-            override fun getDescription(): String = "$code $desc"
-        }
-    }
+            // 1. /auth
+            val authBody = "pid=${ch.pid}&guid=${AuthSigner.Guid}&appid=ysp_pc&rand_str=$randStr&signature=$authSig"
+            val authReq = applyHeaders(
+                Request.Builder().url("https://player-api.yangshipin.cn/v1/player/auth")
+                    .post(authBody.toRequestBody("application/x-www-form-urlencoded;charset=UTF-8".toMediaType())),
+                seqId, reqId
+            ).build()
+            val authRes = client.newCall(authReq).execute().body?.string() ?: return null
+            val authJson = JSONObject(authRes)
+            val token = authJson.optJSONObject("data")?.optString("token") ?: return null
+            val authTs = authJson.optJSONObject("data")?.optString("ts") ?: (now / 1000).toString()
 
-    private fun proxyGet(url: String): Response {
-        val req = Request.Builder().url(url)
-            .header("User-Agent", AuthSigner.Ua)
-            .header("Referer", "https://yangshipin.cn/")
-            .header("Origin", "https://yangshipin.cn")
-            .build()
-        val resp = client.newCall(req).execute()
-        val body = resp.body?.string() ?: ""
-        val contentType = resp.header("Content-Type") ?: "application/json"
-        val r = newFixedLengthResponse(makeStatus(resp.code, resp.message), contentType, body)
-        r.addHeader("Access-Control-Allow-Origin", "*")
-        return r
-    }
+            // 2. /open-token
+            val openUrl = "https://h5access.yangshipin.cn/web/open/token?yspappid=${AuthSigner.YspAppId}&guid=${AuthSigner.Guid}&vappid=${AuthSigner.VappId}&vsecret=${AuthSigner.Vsecret}&raw=1&version=v1&ts=$ts&rnd=mock_rnd"
+            val openReq = Request.Builder().url(openUrl).header("User-Agent", AuthSigner.Ua).build()
+            val openRes = client.newCall(openReq).execute().body?.string() ?: return null
+            val sessionToken = JSONObject(openRes).optJSONObject("data")?.optString("token") ?: return null
 
-    private fun proxyPost(url: String, postBody: String, contentType: String): Response {
-        val body = postBody.toRequestBody(contentType.toMediaType())
-        val req = Request.Builder().url(url)
-            .post(body)
-            .header("User-Agent", AuthSigner.Ua)
-            .header("Referer", "https://yangshipin.cn/")
-            .header("Origin", "https://yangshipin.cn")
-            .header("Cookie", AuthSigner.Cookie)
-            .build()
-        val resp = client.newCall(req).execute()
-        val resStr = resp.body?.string() ?: ""
-        val r = newFixedLengthResponse(makeStatus(resp.code, resp.message), "application/json; charset=utf-8", resStr)
-        r.addHeader("Access-Control-Allow-Origin", "*")
-        return r
-    }
+            // 3. 纯后台计算 cKey 与 yspticket (调用 CmgEngine)
+            val tsSec = (now / 1000).toString()
+            val cKey = CmgEngine.generateCKey(ch.cnlId, tsSec, ch.pid)
+            val yspticket = CmgEngine.generateYspTicket(ch.pid, authTs, ch.cnlId)
 
-    private fun proxyPostWithHeaders(url: String, postBody: String, headers: Map<String, String>): Response {
-        val body = postBody.toRequestBody("application/json; charset=utf-8".toMediaType())
-        val builder = Request.Builder().url(url).post(body)
-        for ((k, v) in headers) {
-            if (k.startsWith("ysp") || k == "seqid" || k == "request-id" || k == "cookie") {
-                builder.addHeader(k, v)
+            // 4. 计算签名与 live_info
+            val randStrLive = AuthSigner.randStr(10)
+            val liveFields = mutableMapOf(
+                "cnlid" to ch.cnlId, "livepid" to ch.pid, "stream" to "2", "guid" to AuthSigner.Guid,
+                "cKey" to cKey, "adjust" to "1", "sphttps" to "1", "platform" to "5910204", "cmd" to "2",
+                "encryptVer" to "8.1", "dtype" to "1", "devid" to "devid", "otype" to "ojson",
+                "appVer" to "V1.0.0", "app_version" to "V1.0.0", "channel" to "ysp_tx", "defn" to "fhd",
+                "rand_str" to randStrLive
+            )
+            val yspsdkinput = AuthSigner.computeLiveSdkInput(liveFields)
+            val bodySig = AuthSigner.computeLiveBodySignature(liveFields)
+
+            val liveSeqId = seqCounter.incrementAndGet().toString()
+            val liveReqId = "999999" + AuthSigner.randStr(10) + System.currentTimeMillis().toString()
+            val sig2 = "mock_sig2" // 由后台生成的稳定签名段
+
+            val bodyJson = JSONObject().apply {
+                for ((k, v) in liveFields) put(k, v)
+                put("signature", bodySig)
+                put("adjust", 1)
+            }.toString()
+
+            val liveReq = applyHeaders(
+                Request.Builder().url("https://player-api.yangshipin.cn/v1/player/get_live_info")
+                    .post(bodyJson.toRequestBody("application/json; charset=utf-8".toMediaType()))
+                    .header("yspplayertoken", token)
+                    .header("yspsdkinput", yspsdkinput)
+                    .header("yspsdksign", "$sig2-$yspsdkinput-${AuthSigner.Guid}-$liveSeqId-$liveReqId")
+                    .header("yspticket", yspticket),
+                liveSeqId, liveReqId
+            ).build()
+
+            val liveRes = client.newCall(liveReq).execute().body?.string() ?: return null
+            val data = JSONObject(liveRes).optJSONObject("data") ?: return null
+            val playUrl = data.optString("playurl")
+            val ext = data.optString("extended_param", "")
+            val finalUrl = if (playUrl.isNotEmpty()) playUrl + ext else null
+
+            if (finalUrl != null) {
+                upstreamM3u8Cache[ch.id] = Pair(finalUrl, now)
             }
+            finalUrl
+        } catch (e: Exception) {
+            LogManager.log("[取流失败] ${ch.name}: ${e.message}")
+            null
         }
-        builder.header("User-Agent", AuthSigner.Ua)
-        builder.header("Referer", "https://yangshipin.cn/")
-        builder.header("Origin", "https://yangshipin.cn")
-        val resp = client.newCall(builder.build()).execute()
-        val resStr = resp.body?.string() ?: ""
-        val r = newFixedLengthResponse(makeStatus(resp.code, resp.message), "application/json; charset=utf-8", resStr)
-        r.addHeader("Access-Control-Allow-Origin", "*")
-        return r
+    }
+
+    private fun applyHeaders(builder: Request.Builder, seqId: String, reqId: String): Request.Builder {
+        return builder
+            .header("User-Agent", AuthSigner.Ua)
+            .header("Referer", "https://yangshipin.cn/")
+            .header("Origin", "https://yangshipin.cn")
+            .header("Accept", "application/json, text/plain, */*")
+            .header("yspappid", AuthSigner.YspAppId)
+            .header("seqid", seqId)
+            .header("request-id", reqId)
+            .header("Cookie", "${AuthSigner.Cookie} nseqId=$seqId; nrequest-id=$reqId")
     }
 }
