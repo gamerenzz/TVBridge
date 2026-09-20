@@ -18,12 +18,27 @@ import okhttp3.*
 import okhttp3.MediaType.Companion.toMediaType
 import okhttp3.RequestBody.Companion.toRequestBody
 import org.json.JSONObject
-import java.io.IOException
 import java.text.SimpleDateFormat
 import java.util.*
-import java.util.concurrent.CompletableFuture
 import java.util.concurrent.CopyOnWriteArrayList
+import java.util.concurrent.CountDownLatch
 import java.util.concurrent.TimeUnit
+
+// 兼容全版本 Android 的简易线程同步器
+class SyncValue<T> {
+    private val latch = CountDownLatch(1)
+    @Volatile private var value: T? = null
+
+    fun set(v: T) {
+        value = v
+        latch.countDown()
+    }
+
+    fun get(timeout: Long, unit: TimeUnit): T? {
+        latch.await(timeout, unit)
+        return value
+    }
+}
 
 object LogManager {
     private val sdf = SimpleDateFormat("HH:mm:ss", Locale.getDefault())
@@ -56,9 +71,8 @@ class MainActivity : AppCompatActivity() {
         .readTimeout(20, TimeUnit.SECONDS)
         .build()
 
-    // 跨平台桥接 Future
-    private var tokenRndFuture: CompletableFuture<String>? = null
-    private var signatureFuture: CompletableFuture<String>? = null
+    private var tokenRndFuture: SyncValue<String>? = null
+    private var signatureFuture: SyncValue<String>? = null
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
@@ -74,21 +88,19 @@ class MainActivity : AppCompatActivity() {
         val tabSatellite = findViewById<Button>(R.id.tabSatellite)
         val tabLocal = findViewById<Button>(R.id.tabLocal)
 
-        // 1. 启动后台中继服务 (监听 18888)
-        startService(Intent(this, BridgeService::class.java).apply {
-            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
-                startForegroundService(this)
-            } else {
-                startService(this)
-            }
-        })
+        // 启动后台中继服务
+        val intent = Intent(this, BridgeService::class.java)
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+            startForegroundService(intent)
+        } else {
+            startService(intent)
+        }
         val hiddenContainer = findViewById<ViewGroup>(R.id.hiddenWebContainer)
         WebViewKeeper.init(this, hiddenContainer)
 
-        // 2. 初始化核心播放器 WebView
+        // 初始化播放器
         initPlayerWebView()
 
-        // 3. 配置列表与分类
         rvChannels.layoutManager = LinearLayoutManager(this)
         adapter = ChannelAdapter(getFilteredChannels()) { ch ->
             playChannel(ch)
@@ -124,17 +136,16 @@ class MainActivity : AppCompatActivity() {
             cacheMode = WebSettings.LOAD_NO_CACHE
         }
 
-        // 注入 Windows WebView2 兼容接口 (window.chrome.webview.postMessage)
         playerWebView.addJavascriptInterface(object {
             @JavascriptInterface
             fun postMessage(jsonStr: String) {
                 try {
                     val obj = JSONObject(jsonStr)
                     if (obj.has("tokenRnd")) {
-                        tokenRndFuture?.complete(obj.getString("tokenRnd"))
+                        tokenRndFuture?.set(obj.getString("tokenRnd"))
                     }
                     if (obj.has("signature")) {
-                        signatureFuture?.complete(obj.getString("signature"))
+                        signatureFuture?.set(obj.getString("signature"))
                     }
                     if (obj.has("dblclick") || obj.has("menu")) {
                         runOnUiThread {
@@ -149,7 +160,6 @@ class MainActivity : AppCompatActivity() {
 
         playerWebView.webViewClient = object : WebViewClient() {
             override fun onPageFinished(view: WebView?, url: String?) {
-                // 注入兼容 polyfill，让 player.served.html 能像在 Windows 下一样发送 postMessage
                 val polyfill = """
                     if (!window.chrome) window.chrome = {};
                     if (!window.chrome.webview) {
@@ -162,13 +172,10 @@ class MainActivity : AppCompatActivity() {
                     }
                 """.trimIndent()
                 playerWebView.evaluateJavascript(polyfill, null)
-
-                // 首次加载完毕自动播放第一个台
                 playChannel(ChannelRepository.channels.first())
             }
         }
 
-        // 加载本地托管的播放页
         playerWebView.loadUrl("http://127.0.0.1:18888/player")
     }
 
@@ -176,19 +183,16 @@ class MainActivity : AppCompatActivity() {
         return ChannelRepository.channels.filter { it.group == currentGroup }
     }
 
-    // 播放频道调度
     private fun playChannel(ch: TvChannel) {
         tvCurrentPlaying.text = "${ch.name} (加载中...)"
 
         if (ch.group == ChannelGroup.LOCAL) {
-            // 湖北台流直接播放改写后的本地 m3u8
             val localM3u8 = "http://127.0.0.1:18888/hbtv/${ch.id}.m3u8"
             startHlsPlay(localM3u8)
             tvCurrentPlaying.text = "${ch.name} (播放中)"
             return
         }
 
-        // 央视/卫视官方取流全流程 (异步调度)
         Thread {
             try {
                 val m3u8 = fetchCctvM3u8(ch)
@@ -208,7 +212,6 @@ class MainActivity : AppCompatActivity() {
         }.start()
     }
 
-    // 官方鉴权全流程：auth -> openToken -> cKey -> yspticket -> get_live_info
     private fun fetchCctvM3u8(ch: TvChannel): String? {
         val randStr = AuthSigner.randStr(10)
         val authSig = AuthSigner.computeAuthSignature(ch.pid, AuthSigner.Guid, randStr)
@@ -226,8 +229,8 @@ class MainActivity : AppCompatActivity() {
         val token = authJson.optJSONObject("data")?.optString("token") ?: return null
         val authTs = authJson.optJSONObject("data")?.optString("ts") ?: (System.currentTimeMillis() / 1000).toString()
 
-        // 2. JS 生成 tokenRnd -> GET /open-token
-        tokenRndFuture = CompletableFuture()
+        // 2. JS 算 tokenRnd -> GET /open-token
+        tokenRndFuture = SyncValue()
         runOnUiThread {
             playerWebView.evaluateJavascript("window.__genTokenRnd('${AuthSigner.Guid}', '$token', '$ts')", null)
         }
@@ -237,27 +240,27 @@ class MainActivity : AppCompatActivity() {
         val openRes = httpClient.newCall(Request.Builder().url(openUrl).build()).execute().body?.string() ?: return null
         val sessionToken = JSONObject(openRes).optJSONObject("data")?.optString("token") ?: return null
 
-        // 3. 动态生成 cKey (调用页面内 fb15 webpack)
-        val cKeyFuture = CompletableFuture<String>()
+        // 3. 动态 cKey
+        val cKeyFuture = SyncValue<String>()
         val safeUrl = "https://yangshipin.cn/tv/home?pid=${ch.pid}"
         val tsSec = (System.currentTimeMillis() / 1000).toString()
         runOnUiThread {
             playerWebView.evaluateJavascript("window.__genCKey('${ch.cnlId}', '$tsSec', 'V1.0.0', '${AuthSigner.Guid}', '5910204', '$safeUrl')") { res ->
                 val v = res?.trim('"', '\'', ' ') ?: ""
-                cKeyFuture.complete(v)
+                cKeyFuture.set(v)
             }
         }
-        val cKey = cKeyFuture.get(5, TimeUnit.SECONDS)
+        val cKey = cKeyFuture.get(5, TimeUnit.SECONDS) ?: ""
 
-        // 4. 动态生成 yspticket (调用页面内 RJq7sO71JF.wasm)
-        val ticketFuture = CompletableFuture<String>()
+        // 4. 动态 yspticket
+        val ticketFuture = SyncValue<String>()
         runOnUiThread {
             playerWebView.evaluateJavascript("window.__genYspTicket('${ch.pid}', '$authTs', '${ch.cnlId}', '${AuthSigner.Guid}', '${AuthSigner.YspAppId}', 'V1.0.0')") { res ->
                 val v = res?.trim('"', '\'', ' ') ?: ""
-                ticketFuture.complete(v)
+                ticketFuture.set(v)
             }
         }
-        val yspticket = ticketFuture.get(5, TimeUnit.SECONDS)
+        val yspticket = ticketFuture.get(5, TimeUnit.SECONDS) ?: ""
 
         // 5. 计算 sdkInput 与 bodySig
         val randStrLive = AuthSigner.randStr(10)
@@ -271,15 +274,18 @@ class MainActivity : AppCompatActivity() {
         val yspsdkinput = AuthSigner.computeLiveSdkInput(liveFields)
         val bodySig = AuthSigner.computeLiveBodySignature(liveFields)
 
-        // 6. 生成 sig2 (openapi_signature)
-        signatureFuture = CompletableFuture()
+        // 6. 生成 sig2
+        signatureFuture = SyncValue()
         runOnUiThread {
             playerWebView.evaluateJavascript("window.__generateSignature('${ch.pid}','${AuthSigner.Guid}','$seqId','$reqId','$sessionToken','$ts','$yspsdkinput')", null)
         }
         val sig2 = signatureFuture?.get(8, TimeUnit.SECONDS) ?: return null
 
         // 7. POST /get-live-info
-        val bodyJson = JSONObject(liveFields as Map<*, *>).apply {
+        val bodyJson = JSONObject().apply {
+            for ((k, v) in liveFields) {
+                put(k, v)
+            }
             put("signature", bodySig)
             put("adjust", 1)
         }.toString()
@@ -308,7 +314,6 @@ class MainActivity : AppCompatActivity() {
         playerWebView.evaluateJavascript("window.__startM3u8('$safe');", null)
     }
 
-    // 电视盒子遥控器上下换台与确定键选台支持
     override fun onKeyDown(keyCode: Int, event: KeyEvent?): Boolean {
         val currentList = getFilteredChannels()
         if (currentList.isEmpty()) return super.onKeyDown(keyCode, event)
@@ -338,7 +343,6 @@ class MainActivity : AppCompatActivity() {
         return super.onKeyDown(keyCode, event)
     }
 
-    // 频道列表适配器
     class ChannelAdapter(
         private var list: List<TvChannel>,
         private val onClick: (TvChannel) -> Unit
@@ -358,7 +362,6 @@ class MainActivity : AppCompatActivity() {
             holder.tvName.text = ch.name
             holder.itemView.setOnClickListener { onClick(ch) }
 
-            // TV 遥控器焦点高亮
             holder.itemView.setOnFocusChangeListener { view, hasFocus ->
                 view.setBackgroundColor(if (hasFocus) 0xFF2F6BFF.toInt() else 0xFF21213E.toInt())
             }
