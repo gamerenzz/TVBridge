@@ -14,7 +14,7 @@ object CmgEngine {
     private val mainHandler = Handler(Looper.getMainLooper())
     @SuppressLint("StaticFieldLeak")
     private var headLessWebView: WebView? = null
-    private var isInitialized = false
+    @Volatile private var isInitialized = false
 
     @Volatile private var tokenRndLatch: CountDownLatch? = null
     @Volatile private var tokenRndVal: String = ""
@@ -72,7 +72,7 @@ object CmgEngine {
                             """.trimIndent()
                             evaluateJavascript(polyfill, null)
                             isInitialized = true
-                            LogManager.log("[CmgEngine] 后台计算环境就绪 (18888/player)")
+                            LogManager.log("[CmgEngine] 计算内核就绪 (18888/player)")
                         }
                     }
 
@@ -84,18 +84,20 @@ object CmgEngine {
         }
     }
 
-    // 后台生成 tokenRnd
+    fun isReady(): Boolean = isInitialized
+
+    // 生成 tokenRnd
     fun genTokenRnd(guid: String, token: String, ts: String): String {
         tokenRndVal = ""
         tokenRndLatch = CountDownLatch(1)
         mainHandler.post {
             headLessWebView?.evaluateJavascript("window.__genTokenRnd('$guid', '$token', '$ts');", null)
         }
-        tokenRndLatch?.await(6, TimeUnit.SECONDS)
+        tokenRndLatch?.await(3, TimeUnit.SECONDS)
         return tokenRndVal
     }
 
-    // 后台生成 324位 cKey
+    // 生成 324位 cKey
     fun generateCKey(cnlId: String, tsSec: String, pid: String): String {
         val latch = CountDownLatch(1)
         var res = ""
@@ -106,11 +108,11 @@ object CmgEngine {
                 latch.countDown()
             }
         }
-        latch.await(5, TimeUnit.SECONDS)
+        latch.await(3, TimeUnit.SECONDS)
         return res
     }
 
-    // 后台生成 yspticket
+    // 生成 yspticket
     fun generateYspTicket(pid: String, authTs: String, cnlId: String): String {
         val latch = CountDownLatch(1)
         var res = ""
@@ -120,25 +122,22 @@ object CmgEngine {
                 latch.countDown()
             }
         }
-        latch.await(5, TimeUnit.SECONDS)
+        latch.await(3, TimeUnit.SECONDS)
         return res
     }
 
-    // 后台生成 sig2
+    // 生成 sig2
     fun generateSig2(pid: String, guid: String, seqId: String, reqId: String, sessionToken: String, ts: String, yspsdkinput: String): String {
         sig2Val = ""
         sig2Latch = CountDownLatch(1)
         mainHandler.post {
             headLessWebView?.evaluateJavascript("window.__generateSignature('$pid','$guid','$seqId','$reqId','$sessionToken','$ts','$yspsdkinput');", null)
         }
-        sig2Latch?.await(6, TimeUnit.SECONDS)
+        sig2Latch?.await(3, TimeUnit.SECONDS)
         return sig2Val
     }
 
-    // 原地处理 TS 切片
     fun decryptTsInPlace(tsData: ByteArray): ByteArray {
-        if (tsData.size < 188) return tsData
-        // CCTV-6 保持直通；加密频道由后台管道完成数据归一化
         return tsData
     }
 
