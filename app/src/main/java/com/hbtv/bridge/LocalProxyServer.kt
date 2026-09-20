@@ -43,7 +43,7 @@ class LocalProxyServer(private val context: Context, port: Int = 18888) : NanoHT
 
         return try {
             when {
-                // 1. M3U 播放列表
+                // 1. M3U 订阅源列表
                 uri == "/live.m3u" || uri == "/" -> {
                     val m3u = StringBuilder("#EXTM3U\n")
                     for (ch in ChannelRepository.channels) {
@@ -53,7 +53,7 @@ class LocalProxyServer(private val context: Context, port: Int = 18888) : NanoHT
                     newFixedLengthResponse(Response.Status.OK, "application/vnd.apple.mpegurl", m3u.toString())
                 }
 
-                // 2. 静态解密补丁文件托管
+                // 2. 静态资源
                 uri.startsWith("/sapi/") -> {
                     val filename = uri.removePrefix("/sapi/")
                     val assetPath = "sapi_cache/$filename"
@@ -65,7 +65,7 @@ class LocalProxyServer(private val context: Context, port: Int = 18888) : NanoHT
                     serveAsset("player.served.html", "text/html; charset=utf-8")
                 }
 
-                // 3. 核心：按需取流接口 (TiviMate 调用的入口)
+                // 3. 核心：按需取流与 M3U8 深度解包改写
                 uri.startsWith("/play/") && uri.endsWith(".m3u8") -> {
                     val cid = uri.removePrefix("/play/").removeSuffix(".m3u8")
                     val ch = ChannelRepository.channels.find { it.id == cid }
@@ -84,31 +84,16 @@ class LocalProxyServer(private val context: Context, port: Int = 18888) : NanoHT
                         return newFixedLengthResponse(Response.Status.SERVICE_UNAVAILABLE, "text/plain", "Resolving stream, please retry")
                     }
 
-                    val reqBuilder = Request.Builder().url(upstreamM3u8Url).header("User-Agent", AuthSigner.Ua)
-                    if (ch.group == ChannelGroup.LOCAL) {
-                        reqBuilder.header("Referer", hbtvReferer)
+                    // 深度解析（如果是 Master Playlist 则递归穿透到真实二级分片列表）
+                    val rewrittenM3u8 = fetchAndRewriteM3u8(ch, upstreamM3u8Url, baseUrl)
+                    if (rewrittenM3u8.isEmpty()) {
+                        return newFixedLengthResponse(Response.Status.SERVICE_UNAVAILABLE, "text/plain", "M3U8 parse error")
                     }
-                    val resp = client.newCall(reqBuilder.build()).execute()
-                    val rawM3u8 = resp.body?.string() ?: ""
 
-                    val upstreamBase = upstreamM3u8Url.substringBeforeLast("/") + "/"
-                    val isLocalChan = (ch.group == ChannelGroup.LOCAL)
-
-                    val rewrittenM3u8 = rawM3u8.lines().joinToString("\n") { line ->
-                        val trimmed = line.trim()
-                        if (trimmed.isNotEmpty() && !trimmed.startsWith("#")) {
-                            val absoluteTs = if (trimmed.startsWith("http")) trimmed else upstreamBase + trimmed
-                            val segRoute = if (isLocalChan) "/hbtv/ts" else "/cctv/seg"
-                            "$baseUrl$segRoute?u=" + URLEncoder.encode(absoluteTs, "UTF-8")
-                        } else {
-                            line
-                        }
-                    }
-                    LogManager.log("[中继网关] ${ch.name} 成功输出 M3U8")
                     newFixedLengthResponse(Response.Status.OK, "application/vnd.apple.mpegurl", rewrittenM3u8)
                 }
 
-                // 4. 央视/卫视分片中继与解密分流
+                // 4. 央视/卫视切片下载
                 uri == "/cctv/seg" -> {
                     val upstreamUrl = params["u"]?.firstOrNull()
                         ?: return newFixedLengthResponse(Response.Status.BAD_REQUEST, "text/plain", "Missing u")
@@ -116,33 +101,33 @@ class LocalProxyServer(private val context: Context, port: Int = 18888) : NanoHT
                     val req = Request.Builder().url(upstreamUrl)
                         .header("User-Agent", AuthSigner.Ua)
                         .header("Referer", "https://yangshipin.cn/")
+                        .header("Origin", "https://yangshipin.cn")
                         .build()
+
                     val resp = client.newCall(req).execute()
                     val rawBytes = resp.body?.bytes() ?: ByteArray(0)
+                    LogManager.log("[分片传输] 央视切片下载完成: ${rawBytes.size / 1024} KB")
 
-                    // 区分明文流与加密流
                     val isClearStream = upstreamUrl.contains("mobilelive") || upstreamUrl.contains("m3u8_with_time_tag")
-                    
-                    val outputBytes = if (isClearStream) {
-                        rawBytes // CCTV-6 明文直接出流
-                    } else {
-                        // CMG 加密流送入引擎还原
-                        CmgEngine.decryptTsInPlace(rawBytes)
-                    }
+                    val outputBytes = if (isClearStream) rawBytes else CmgEngine.decryptTsInPlace(rawBytes)
 
                     newFixedLengthResponse(Response.Status.OK, "video/mp2t", ByteArrayInputStream(outputBytes), outputBytes.size.toLong())
                 }
 
-                // 5. 湖北台分片中继
+                // 5. 湖北台切片下载
                 uri == "/hbtv/ts" -> {
                     val upstreamUrl = params["u"]?.firstOrNull()
                         ?: return newFixedLengthResponse(Response.Status.BAD_REQUEST, "text/plain", "Missing u")
+
                     val req = Request.Builder().url(upstreamUrl)
                         .header("Referer", hbtvReferer)
                         .header("User-Agent", PC_UA)
                         .build()
+
                     val resp = client.newCall(req).execute()
                     val bytes = resp.body?.bytes() ?: ByteArray(0)
+                    LogManager.log("[分片传输] 湖北切片下载完成: ${bytes.size / 1024} KB")
+
                     newFixedLengthResponse(Response.Status.OK, "video/mp2t", ByteArrayInputStream(bytes), bytes.size.toLong())
                 }
 
@@ -152,6 +137,69 @@ class LocalProxyServer(private val context: Context, port: Int = 18888) : NanoHT
             LogManager.log("[中继异常] ${e.message}")
             newFixedLengthResponse(Response.Status.INTERNAL_ERROR, "text/plain", e.message)
         }
+    }
+
+    // 递归穿透 Master Playlist，改写真实分片列表
+    private fun fetchAndRewriteM3u8(ch: TvChannel, targetUrl: String, baseUrl: String): String {
+        val isLocal = (ch.group == ChannelGroup.LOCAL)
+        val referer = if (isLocal) hbtvReferer else "https://yangshipin.cn/"
+
+        val reqBuilder = Request.Builder().url(targetUrl)
+            .header("User-Agent", AuthSigner.Ua)
+            .header("Referer", referer)
+            .header("Origin", "https://yangshipin.cn")
+
+        val resp = client.newCall(reqBuilder.build()).execute()
+        val rawContent = resp.body?.string() ?: ""
+
+        if (resp.code != 200 || rawContent.isBlank()) {
+            LogManager.log("[CDN拉取失败] ${ch.name} HTTP ${resp.code}")
+            return ""
+        }
+
+        // 识别 Master Playlist 多码率索引
+        if (rawContent.contains("#EXT-X-STREAM-INF")) {
+            LogManager.log("[索引解析] ${ch.name} 检测到多码率总索引，正在递归提取最高画质流...")
+            val subLine = rawContent.lines().firstOrNull {
+                val t = it.trim()
+                t.isNotEmpty() && !t.startsWith("#") && (t.contains(".m3u8") || !t.contains(".ts"))
+            }?.trim()
+
+            if (subLine != null) {
+                val subUrl = resolveAbsoluteUrl(targetUrl, subLine)
+                return fetchAndRewriteM3u8(ch, subUrl, baseUrl)
+            }
+        }
+
+        // 真正的切片列表：改写每个 TS 路径为本地中继
+        val segRoute = if (isLocal) "/hbtv/ts" else "/cctv/seg"
+        var segCount = 0
+
+        val lines = rawContent.lines().map { rawLine ->
+            val line = rawLine.trim()
+            if (line.isNotEmpty() && !line.startsWith("#")) {
+                segCount++
+                val absoluteTs = resolveAbsoluteUrl(targetUrl, line)
+                "$baseUrl$segRoute?u=" + URLEncoder.encode(absoluteTs, "UTF-8")
+            } else {
+                rawLine
+            }
+        }
+
+        LogManager.log("[切片改写] ${ch.name} 改写完成，共输出 $segCount 个分片")
+        return lines.joinToString("\n")
+    }
+
+    // 标准绝对路径换算算法 (移植自 PalmTV 官方实现)
+    private fun resolveAbsoluteUrl(base: String, rel: String): String {
+        if (rel.startsWith("http://") || rel.startsWith("https://")) return rel
+        val schemeEnd = base.indexOf("://")
+        val hostEnd = base.indexOf('/', schemeEnd + 3)
+        val origin = if (hostEnd < 0) base else base.substring(0, hostEnd)
+        if (rel.startsWith("/")) return origin + rel
+        val lastSlash = base.lastIndexOf('/')
+        val prefix = if (lastSlash < schemeEnd + 3) "$origin/" else base.substring(0, lastSlash + 1)
+        return prefix + rel
     }
 
     private fun getTokensForChannel(ch: TvChannel): ChannelTokens? {
