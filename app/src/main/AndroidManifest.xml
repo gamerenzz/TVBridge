@@ -1,7 +1,6 @@
 <?xml version="1.0" encoding="utf-8"?>
 <manifest xmlns:android="http://schemas.android.com/apk/res/android">
 
-    <!-- 网络与前台服务保活权限 -->
     <uses-permission android:name="android.permission.INTERNET" />
     <uses-permission android:name="android.permission.ACCESS_NETWORK_STATE" />
     <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
@@ -9,10 +8,13 @@
     <uses-permission android:name="android.permission.FOREGROUND_SERVICE_DATA_SYNC" />
     <uses-permission android:name="android.permission.WAKE_LOCK" />
 
+    <uses-feature android:name="android.hardware.touchscreen" android:required="false" />
+    <uses-feature android:name="android.software.leanback" android:required="false" />
+
     <application
         android:allowBackup="true"
         android:icon="@drawable/ic_launcher"
-        android:label="长江云直播助手"
+        android:label="掌上电视 · 双模版"
         android:roundIcon="@drawable/ic_launcher"
         android:supportsRtl="true"
         android:theme="@style/Theme.MaterialComponents.Light.NoActionBar"
@@ -20,16 +22,16 @@
 
         <activity
             android:name=".MainActivity"
-            android:exported="true">
+            android:configChanges="orientation|screenSize|smallestScreenSize|screenLayout|keyboardHidden"
+            android:exported="true"
+            android:launchMode="singleTop">
             <intent-filter>
                 <action android:name="android.intent.action.MAIN" />
                 <category android:name="android.intent.category.LAUNCHER" />
-                <!-- 兼容电视盒子与原生 Android TV 桌面 -->
                 <category android:name="android.intent.category.LEANBACK_LAUNCHER" />
             </intent-filter>
         </activity>
 
-        <!-- 声明中继服务与前台类型 -->
         <service
             android:name=".BridgeService"
             android:enabled="true"
