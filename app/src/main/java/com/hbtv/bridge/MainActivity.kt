@@ -71,7 +71,7 @@ class MainActivity : AppCompatActivity() {
     private lateinit var adapter: ChannelAdapter
     private var currentChannelIndex = 0
 
-    // 单调递增的序号，防止被服务器风控拒绝
+    // 持久单调递增计数器
     private val seqCounter = AtomicLong(System.currentTimeMillis() / 1000)
 
     private val httpClient = OkHttpClient.Builder()
@@ -277,7 +277,6 @@ class MainActivity : AppCompatActivity() {
         }.start()
     }
 
-    // 注入与官方 APISIX 网关完全匹配的浏览器级请求头
     private fun applyBrowserHeaders(builder: Request.Builder, seqId: String, reqId: String): Request.Builder {
         return builder
             .header("User-Agent", AuthSigner.Ua)
@@ -302,41 +301,43 @@ class MainActivity : AppCompatActivity() {
     private fun fetchCctvM3u8(ch: TvChannel): String? {
         val randStr = AuthSigner.randStr(10)
         val authSig = AuthSigner.computeAuthSignature(ch.pid, AuthSigner.Guid, randStr)
-        val seqId = seqCounter.incrementAndGet().toString()
-        val ts = System.currentTimeMillis().toString()
-        val reqId = "999999" + AuthSigner.randStr(10) + ts
+        val seqId1 = seqCounter.incrementAndGet().toString()
+        val ts1 = System.currentTimeMillis().toString()
+        val reqId1 = "999999" + AuthSigner.randStr(10) + ts1
 
-        // 1. POST /v1/player/auth (带全套网关指纹头)
+        // 1. POST /v1/player/auth
         LogManager.log("1. 请求 /auth 鉴权...")
         val authBody = "pid=${ch.pid}&guid=${AuthSigner.Guid}&appid=ysp_pc&rand_str=$randStr&signature=$authSig"
         val authReq = applyBrowserHeaders(
             Request.Builder()
                 .url("https://player-api.yangshipin.cn/v1/player/auth")
                 .post(authBody.toRequestBody("application/x-www-form-urlencoded;charset=UTF-8".toMediaType())),
-            seqId, reqId
+            seqId1, reqId1
         ).build()
 
         val authResp = httpClient.newCall(authReq).execute()
         val authRes = authResp.body?.string() ?: ""
-        LogManager.log("auth 返回 [HTTP ${authResp.code}]: ${authRes.take(70)}...")
-        if (authResp.code != 200 || authRes.isEmpty()) return null
+        if (authResp.code != 200 || authRes.isEmpty()) {
+            LogManager.log("auth 失败 [HTTP ${authResp.code}]")
+            return null
+        }
 
         val authJson = JSONObject(authRes)
         val token = authJson.optJSONObject("data")?.optString("token") ?: return null
         val authTs = authJson.optJSONObject("data")?.optString("ts") ?: (System.currentTimeMillis() / 1000).toString()
 
-        // 2. JS 生成 tokenRnd -> GET /web/open/token
+        // 2. JS 算 tokenRnd -> GET /web/open/token
         LogManager.log("2. 计算 tokenRnd 并换取 sessionToken...")
         tokenRndFuture = SyncValue()
         runOnUiThread {
-            playerWebView.evaluateJavascript("window.__genTokenRnd('${AuthSigner.Guid}', '$token', '$ts')", null)
+            playerWebView.evaluateJavascript("window.__genTokenRnd('${AuthSigner.Guid}', '$token', '$ts1')", null)
         }
         val rndVal = tokenRndFuture?.get(8, TimeUnit.SECONDS) ?: run {
             LogManager.log("tokenRnd 计算超时")
             return null
         }
 
-        val openUrl = "https://h5access.yangshipin.cn/web/open/token?yspappid=${AuthSigner.YspAppId}&guid=${AuthSigner.Guid}&vappid=${AuthSigner.VappId}&vsecret=${AuthSigner.Vsecret}&raw=1&version=v1&ts=$ts&rnd=$rndVal"
+        val openUrl = "https://h5access.yangshipin.cn/web/open/token?yspappid=${AuthSigner.YspAppId}&guid=${AuthSigner.Guid}&vappid=${AuthSigner.VappId}&vsecret=${AuthSigner.Vsecret}&raw=1&version=v1&ts=$ts1&rnd=$rndVal"
         val openReq = Request.Builder().url(openUrl)
             .header("User-Agent", AuthSigner.Ua)
             .header("Referer", "https://yangshipin.cn/")
@@ -345,10 +346,12 @@ class MainActivity : AppCompatActivity() {
             .build()
         val openResp = httpClient.newCall(openReq).execute()
         val openRes = openResp.body?.string() ?: ""
-        LogManager.log("openToken 返回 [HTTP ${openResp.code}]: ${openRes.take(70)}...")
-        val sessionToken = JSONObject(openRes).optJSONObject("data")?.optString("token") ?: return null
+        val sessionToken = JSONObject(openRes).optJSONObject("data")?.optString("token") ?: run {
+            LogManager.log("openToken 失败 [HTTP ${openResp.code}]")
+            return null
+        }
 
-        // 3. 动态 cKey (调用页面内 fb15 webpack 模块)
+        // 3. 动态 cKey
         LogManager.log("3. 生成 324位 cKey...")
         val cKeyFuture = SyncValue<String>()
         val safeUrl = "https://yangshipin.cn/tv/home?pid=${ch.pid}"
@@ -360,8 +363,9 @@ class MainActivity : AppCompatActivity() {
             }
         }
         val cKey = cKeyFuture.get(5, TimeUnit.SECONDS) ?: ""
+        LogManager.log("cKey 长度: ${cKey.length}")
 
-        // 4. 动态 yspticket (调用页面内 RJq7sO71JF.wasm)
+        // 4. 动态 yspticket
         LogManager.log("4. 生成 yspticket...")
         val ticketFuture = SyncValue<String>()
         runOnUiThread {
@@ -371,6 +375,7 @@ class MainActivity : AppCompatActivity() {
             }
         }
         val yspticket = ticketFuture.get(5, TimeUnit.SECONDS) ?: ""
+        LogManager.log("yspticket 长度: ${yspticket.length}")
 
         // 5. 计算 sdkInput 与 bodySig
         val randStrLive = AuthSigner.randStr(10)
@@ -384,18 +389,23 @@ class MainActivity : AppCompatActivity() {
         val yspsdkinput = AuthSigner.computeLiveSdkInput(liveFields)
         val bodySig = AuthSigner.computeLiveBodySignature(liveFields)
 
-        // 6. 算 sig2
+        // ★★★ 核心修复：必须单调递增生成一组【唯一定稿】的 liveSeqId 和 liveReqId ★★★
+        val liveSeqId = seqCounter.incrementAndGet().toString()
+        val liveTs = System.currentTimeMillis().toString()
+        val liveReqId = "999999" + AuthSigner.randStr(10) + liveTs
+
+        // 6. 算 sig2（必须用 liveSeqId 和 liveReqId 算签名！）
         LogManager.log("5. 计算 sig2 签名...")
         signatureFuture = SyncValue()
         runOnUiThread {
-            playerWebView.evaluateJavascript("window.__generateSignature('${ch.pid}','${AuthSigner.Guid}','$seqId','$reqId','$sessionToken','$ts','$yspsdkinput')", null)
+            playerWebView.evaluateJavascript("window.__generateSignature('${ch.pid}','${AuthSigner.Guid}','$liveSeqId','$liveReqId','$sessionToken','$liveTs','$yspsdkinput')", null)
         }
         val sig2 = signatureFuture?.get(8, TimeUnit.SECONDS) ?: run {
             LogManager.log("sig2 计算超时")
             return null
         }
 
-        // 7. POST /v1/player/get_live_info
+        // 7. POST 直连 https://player-api.yangshipin.cn/v1/player/get_live_info
         LogManager.log("6. 请求 get_live_info 获取直播流...")
         val bodyJson = JSONObject().apply {
             for ((k, v) in liveFields) {
@@ -405,22 +415,20 @@ class MainActivity : AppCompatActivity() {
             put("adjust", 1)
         }.toString()
 
-        val seqId2 = seqCounter.incrementAndGet().toString()
-        val reqId2 = "999999" + AuthSigner.randStr(10) + System.currentTimeMillis().toString()
-
         val liveReqBuilder = Request.Builder()
             .url("https://player-api.yangshipin.cn/v1/player/get_live_info")
             .post(bodyJson.toRequestBody("application/json; charset=utf-8".toMediaType()))
             .header("yspplayertoken", token)
             .header("yspsdkinput", yspsdkinput)
-            .header("yspsdksign", "$sig2-$yspsdkinput-${AuthSigner.Guid}-$seqId2-$reqId2")
+            .header("yspsdksign", "$sig2-$yspsdkinput-${AuthSigner.Guid}-$liveSeqId-$liveReqId")
             .header("yspticket", yspticket)
 
-        val liveReq = applyBrowserHeaders(liveReqBuilder, seqId2, reqId2).build()
+        // ★★★ 核心修复：Header 和 Cookie 必须严格使用同一套 liveSeqId 和 liveReqId！
+        val liveReq = applyBrowserHeaders(liveReqBuilder, liveSeqId, liveReqId).build()
 
         val liveResp = httpClient.newCall(liveReq).execute()
         val liveRes = liveResp.body?.string() ?: ""
-        LogManager.log("get_live_info 返回 [HTTP ${liveResp.code}]: ${liveRes.take(70)}...")
+        LogManager.log("get_live_info 返回 [HTTP ${liveResp.code}]: ${liveRes.take(80)}...")
 
         val data = JSONObject(liveRes).optJSONObject("data") ?: return null
         val playUrl = data.optString("playurl")
