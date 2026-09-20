@@ -24,7 +24,6 @@ import java.util.concurrent.CopyOnWriteArrayList
 import java.util.concurrent.CountDownLatch
 import java.util.concurrent.TimeUnit
 
-// 兼容全版本 Android 的简易线程同步器
 class SyncValue<T> {
     private val latch = CountDownLatch(1)
     @Volatile private var value: T? = null
@@ -78,6 +77,9 @@ class MainActivity : AppCompatActivity() {
         super.onCreate(savedInstanceState)
         setContentView(R.layout.activity_main)
 
+        // 1. 【核心修复】必须在最前置同步启动本地 NanoHTTPD 服务器，确保 18888 端口处于监听状态
+        ServerManager.start(this)
+
         playerWebView = findViewById(R.id.playerWebView)
         tvCurrentPlaying = findViewById(R.id.tvCurrentPlaying)
         channelDrawer = findViewById(R.id.channelDrawer)
@@ -88,17 +90,22 @@ class MainActivity : AppCompatActivity() {
         val tabSatellite = findViewById<Button>(R.id.tabSatellite)
         val tabLocal = findViewById<Button>(R.id.tabLocal)
 
-        // 启动后台中继服务
-        val intent = Intent(this, BridgeService::class.java)
-        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
-            startForegroundService(intent)
-        } else {
-            startService(intent)
+        // 2. 尝试启动保活服务（即使通知权限被拒也不阻碍主页面）
+        try {
+            val intent = Intent(this, BridgeService::class.java)
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+                startForegroundService(intent)
+            } else {
+                startService(intent)
+            }
+        } catch (e: Throwable) {
+            // ignore
         }
+
         val hiddenContainer = findViewById<ViewGroup>(R.id.hiddenWebContainer)
         WebViewKeeper.init(this, hiddenContainer)
 
-        // 初始化播放器
+        // 3. 初始化播放器
         initPlayerWebView()
 
         rvChannels.layoutManager = LinearLayoutManager(this)
@@ -160,23 +167,38 @@ class MainActivity : AppCompatActivity() {
 
         playerWebView.webViewClient = object : WebViewClient() {
             override fun onPageFinished(view: WebView?, url: String?) {
-                val polyfill = """
-                    if (!window.chrome) window.chrome = {};
-                    if (!window.chrome.webview) {
-                        window.chrome.webview = {
-                            postMessage: function(msg) {
-                                var s = (typeof msg === 'string') ? msg : JSON.stringify(msg);
-                                AndroidBridge.postMessage(s);
-                            }
-                        };
-                    }
-                """.trimIndent()
-                playerWebView.evaluateJavascript(polyfill, null)
-                playChannel(ChannelRepository.channels.first())
+                // 如果是加载了 player 页面才注入并播放
+                if (url != null && url.contains("18888/player")) {
+                    val polyfill = """
+                        if (!window.chrome) window.chrome = {};
+                        if (!window.chrome.webview) {
+                            window.chrome.webview = {
+                                postMessage: function(msg) {
+                                    var s = (typeof msg === 'string') ? msg : JSON.stringify(msg);
+                                    AndroidBridge.postMessage(s);
+                                }
+                            };
+                        }
+                    """.trimIndent()
+                    playerWebView.evaluateJavascript(polyfill, null)
+                    playChannel(ChannelRepository.channels.first())
+                }
+            }
+
+            override fun onReceivedError(view: WebView?, request: WebResourceRequest?, error: WebResourceError?) {
+                // 如果因为并发原因被拒绝，延迟 500ms 自动重试一次
+                if (request?.isForMainFrame == true) {
+                    playerWebView.postDelayed({
+                        playerWebView.loadUrl("http://127.0.0.1:18888/player")
+                    }, 500)
+                }
             }
         }
 
-        playerWebView.loadUrl("http://127.0.0.1:18888/player")
+        // 延迟 100ms 加载，确保 Socket 彻底就绪
+        playerWebView.postDelayed({
+            playerWebView.loadUrl("http://127.0.0.1:18888/player")
+        }, 100)
     }
 
     private fun getFilteredChannels(): List<TvChannel> {
