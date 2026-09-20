@@ -14,10 +14,11 @@ import java.util.concurrent.TimeUnit
 import java.util.concurrent.atomic.AtomicLong
 import java.util.regex.Pattern
 
-data class SessionTokens(
+data class ChannelTokens(
     val authToken: String,
     val sessionToken: String,
-    val authTs: String
+    val authTs: String,
+    val expireAt: Long
 )
 
 class LocalProxyServer(private val context: Context, port: Int = 18888) : NanoHTTPD(port) {
@@ -32,9 +33,8 @@ class LocalProxyServer(private val context: Context, port: Int = 18888) : NanoHT
     private val tsPattern = Pattern.compile("^https://live\\d+-cjy\\.hbtv\\.com\\.cn/")
 
     private val upstreamM3u8Cache = ConcurrentHashMap<String, Pair<String, Long>>()
-
-    @Volatile private var cachedSession: SessionTokens? = null
-    @Volatile private var sessionExpireAt: Long = 0L
+    // ★ 按频道 PID 独立缓存 Token，杜绝串台导致 401
+    private val tokenCacheByPid = ConcurrentHashMap<String, ChannelTokens>()
 
     override fun serve(session: IHTTPSession): Response {
         val uri = session.uri
@@ -54,7 +54,7 @@ class LocalProxyServer(private val context: Context, port: Int = 18888) : NanoHT
                     newFixedLengthResponse(Response.Status.OK, "application/vnd.apple.mpegurl", m3u.toString())
                 }
 
-                // 2. 静态解密资产文件
+                // 2. 静态解密补丁文件托管
                 uri.startsWith("/sapi/") -> {
                     val filename = uri.removePrefix("/sapi/")
                     val assetPath = "sapi_cache/$filename"
@@ -72,7 +72,7 @@ class LocalProxyServer(private val context: Context, port: Int = 18888) : NanoHT
                     val ch = ChannelRepository.channels.find { it.id == cid }
                         ?: return newFixedLengthResponse(Response.Status.NOT_FOUND, "text/plain", "Channel not found")
 
-                    LogManager.log("[中继网关] 外部播放器请求频道: ${ch.name}")
+                    LogManager.log("[中继网关] 外部播放器请求: ${ch.name}")
 
                     val upstreamM3u8Url = if (ch.group == ChannelGroup.LOCAL) {
                         WebViewKeeper.getUrl(ch.id)
@@ -81,7 +81,7 @@ class LocalProxyServer(private val context: Context, port: Int = 18888) : NanoHT
                     }
 
                     if (upstreamM3u8Url.isNullOrEmpty()) {
-                        LogManager.log("[中继网关] ${ch.name} 取流失败，返回 503")
+                        LogManager.log("[中继网关] ${ch.name} 取流中，返回 503")
                         return newFixedLengthResponse(Response.Status.SERVICE_UNAVAILABLE, "text/plain", "Resolving stream, please retry")
                     }
 
@@ -148,37 +148,46 @@ class LocalProxyServer(private val context: Context, port: Int = 18888) : NanoHT
         }
     }
 
-    // 确保会话处于激活态并保存 authTs
-    @Synchronized
-    private fun ensureSessionTokens(): SessionTokens? {
+    // 按当前频道 PID 精准拉取专属 Token
+    private fun getTokensForChannel(ch: TvChannel): ChannelTokens? {
         val now = System.currentTimeMillis()
-        val s = cachedSession
-        if (s != null && now < sessionExpireAt) {
-            return s
+        val cached = tokenCacheByPid[ch.pid]
+        if (cached != null && now < cached.expireAt) {
+            return cached
         }
 
         try {
             val randStr = AuthSigner.randStr(10)
-            val authSig = AuthSigner.computeAuthSignature("600001859", AuthSigner.Guid, randStr)
+            val authSig = AuthSigner.computeAuthSignature(ch.pid, AuthSigner.Guid, randStr)
             val seqId = seqCounter.incrementAndGet().toString()
             val ts = now.toString()
             val reqId = "999999" + AuthSigner.randStr(10) + ts
 
-            // 1. /auth
-            val authBody = "pid=600001859&guid=${AuthSigner.Guid}&appid=ysp_pc&rand_str=$randStr&signature=$authSig"
+            // 1. /auth (必须传入当前频道的 ch.pid)
+            val authBody = "pid=${ch.pid}&guid=${AuthSigner.Guid}&appid=ysp_pc&rand_str=$randStr&signature=$authSig"
             val authReq = applyBrowserHeaders(
                 Request.Builder().url("https://player-api.yangshipin.cn/v1/player/auth")
                     .post(authBody.toRequestBody("application/x-www-form-urlencoded;charset=UTF-8".toMediaType())),
                 seqId, reqId
             ).build()
-            val authRes = client.newCall(authReq).execute().body?.string() ?: return null
+
+            val authResp = client.newCall(authReq).execute()
+            val authRes = authResp.body?.string() ?: ""
+            if (authResp.code != 200 || authRes.isBlank()) {
+                LogManager.log("[auth错误] ${ch.name} HTTP ${authResp.code}")
+                return null
+            }
+
             val authJson = JSONObject(authRes)
             val token = authJson.optJSONObject("data")?.optString("token") ?: return null
             val authTs = authJson.optJSONObject("data")?.optString("ts") ?: (now / 1000).toString()
 
             // 2. /open-token
             val rndVal = CmgEngine.genTokenRnd(AuthSigner.Guid, token, ts)
-            if (rndVal.isEmpty()) return null
+            if (rndVal.isEmpty()) {
+                LogManager.log("[openToken] tokenRnd 计算超时")
+                return null
+            }
 
             val openUrl = "https://h5access.yangshipin.cn/web/open/token?yspappid=${AuthSigner.YspAppId}&guid=${AuthSigner.Guid}&vappid=${AuthSigner.VappId}&vsecret=${AuthSigner.Vsecret}&raw=1&version=v1&ts=$ts&rnd=$rndVal"
             val openReq = Request.Builder().url(openUrl)
@@ -187,16 +196,17 @@ class LocalProxyServer(private val context: Context, port: Int = 18888) : NanoHT
                 .header("Origin", "https://yangshipin.cn")
                 .header("Accept", "*/*")
                 .build()
-            val openRes = client.newCall(openReq).execute().body?.string() ?: return null
+
+            val openResp = client.newCall(openReq).execute()
+            val openRes = openResp.body?.string() ?: ""
             val sessionToken = JSONObject(openRes).optJSONObject("data")?.optString("token") ?: return null
 
-            val newSession = SessionTokens(token, sessionToken, authTs)
-            cachedSession = newSession
-            sessionExpireAt = now + 20 * 60 * 1000L
-            LogManager.log("[会话] 全局鉴权 Token 刷新成功")
-            return newSession
+            val result = ChannelTokens(token, sessionToken, authTs, now + 15 * 60 * 1000L)
+            tokenCacheByPid[ch.pid] = result
+            LogManager.log("[鉴权成功] ${ch.name} 拿到专属 Token")
+            return result
         } catch (e: Exception) {
-            LogManager.log("[会话异常] ${e.message}")
+            LogManager.log("[鉴权异常] ${ch.name}: ${e.message}")
             return null
         }
     }
@@ -209,15 +219,19 @@ class LocalProxyServer(private val context: Context, port: Int = 18888) : NanoHT
         }
 
         return try {
-            val session = ensureSessionTokens() ?: return null
-            val authToken = session.authToken
-            val sessionToken = session.sessionToken
-            val authTs = session.authTs
+            val tokens = getTokensForChannel(ch) ?: return null
+            val authToken = tokens.authToken
+            val sessionToken = tokens.sessionToken
+            val authTs = tokens.authTs
 
             val tsSec = (now / 1000).toString()
             val cKey = CmgEngine.generateCKey(ch.cnlId, tsSec, ch.pid)
-            // ★ 修复：必须传入 auth 返回的固定 authTs
             val yspticket = CmgEngine.generateYspTicket(ch.pid, authTs, ch.cnlId)
+
+            if (cKey.isEmpty() || yspticket.isEmpty()) {
+                LogManager.log("[取流警告] ${ch.name} cKey 或 yspticket 尚未算出")
+                return null
+            }
 
             val randStrLive = AuthSigner.randStr(10)
             val liveFields = mutableMapOf(
@@ -235,7 +249,7 @@ class LocalProxyServer(private val context: Context, port: Int = 18888) : NanoHT
 
             val sig2 = CmgEngine.generateSig2(ch.pid, AuthSigner.Guid, liveSeqId, liveReqId, sessionToken, now.toString(), yspsdkinput)
             if (sig2.isEmpty()) {
-                LogManager.log("[取流失败] sig2 计算超时")
+                LogManager.log("[取流警告] ${ch.name} sig2 尚未算出")
                 return null
             }
 
@@ -253,14 +267,12 @@ class LocalProxyServer(private val context: Context, port: Int = 18888) : NanoHT
                 .header("yspsdksign", "$sig2-$yspsdkinput-${AuthSigner.Guid}-$liveSeqId-$liveReqId")
                 .header("yspticket", yspticket)
 
-            // ★ 修复：注入与官方网关一致的全套请求头
             val liveReq = applyBrowserHeaders(liveReqBuilder, liveSeqId, liveReqId).build()
-
             val liveResp = client.newCall(liveReq).execute()
             val liveRes = liveResp.body?.string() ?: ""
 
             if (liveResp.code != 200 || liveRes.isBlank()) {
-                LogManager.log("[取流报错] HTTP ${liveResp.code}, 返回: $liveRes")
+                LogManager.log("[取流报错] ${ch.name} HTTP ${liveResp.code}")
                 return null
             }
 
@@ -271,11 +283,11 @@ class LocalProxyServer(private val context: Context, port: Int = 18888) : NanoHT
 
             if (finalUrl != null) {
                 upstreamM3u8Cache[ch.id] = Pair(finalUrl, now)
-                LogManager.log("[取流就绪] ${ch.name} 拿到官方播放流")
+                LogManager.log("[取流成功] ${ch.name} 获取到官方流")
             }
             finalUrl
         } catch (e: Exception) {
-            LogManager.log("[取流失败] ${ch.name}: ${e.message}")
+            LogManager.log("[取流异常] ${ch.name}: ${e.message}")
             null
         }
     }
@@ -292,7 +304,6 @@ class LocalProxyServer(private val context: Context, port: Int = 18888) : NanoHT
         }
     }
 
-    // 完整的浏览器级网关防爬头
     private fun applyBrowserHeaders(builder: Request.Builder, seqId: String, reqId: String): Request.Builder {
         return builder
             .header("User-Agent", AuthSigner.Ua)
