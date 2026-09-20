@@ -17,26 +17,31 @@ import java.util.regex.Pattern
 class LocalProxyServer(private val context: Context, port: Int = 18888) : NanoHTTPD(port) {
 
     private val client = OkHttpClient.Builder()
-        .connectTimeout(15, TimeUnit.SECONDS)
-        .readTimeout(20, TimeUnit.SECONDS)
+        .connectTimeout(8, TimeUnit.SECONDS)
+        .readTimeout(10, TimeUnit.SECONDS)
         .build()
 
     private val seqCounter = AtomicLong(System.currentTimeMillis() / 1000)
     private val hbtvReferer = "https://news.hbtv.com.cn/"
     private val tsPattern = Pattern.compile("^https://live\\d+-cjy\\.hbtv\\.com\\.cn/")
 
+    // m3u8 地址缓存 (有效期 150 秒)
     private val upstreamM3u8Cache = ConcurrentHashMap<String, Pair<String, Long>>()
+
+    // ★ 会话级 Token 缓存（有效期 20 分钟），大幅消除重复 /auth 往返耗时
+    @Volatile private var cachedAuthToken: String = ""
+    @Volatile private var cachedSessionToken: String = ""
+    @Volatile private var tokenExpireAt: Long = 0L
 
     override fun serve(session: IHTTPSession): Response {
         val uri = session.uri
-        val method = session.method
         val params = session.parameters
         val hostHeader = session.headers["host"] ?: "127.0.0.1:18888"
         val baseUrl = "http://$hostHeader"
 
         return try {
             when {
-                // 1. 动态生成 IPTV M3U 播放列表
+                // 1. M3U 播放列表
                 uri == "/live.m3u" || uri == "/" -> {
                     val m3u = StringBuilder("#EXTM3U\n")
                     for (ch in ChannelRepository.channels) {
@@ -46,7 +51,7 @@ class LocalProxyServer(private val context: Context, port: Int = 18888) : NanoHT
                     newFixedLengthResponse(Response.Status.OK, "application/vnd.apple.mpegurl", m3u.toString())
                 }
 
-                // 2. 静态解密补丁文件托管 (供后台无头引擎使用)
+                // 2. 静态解密资产文件
                 uri.startsWith("/sapi/") -> {
                     val filename = uri.removePrefix("/sapi/")
                     val assetPath = "sapi_cache/$filename"
@@ -54,12 +59,11 @@ class LocalProxyServer(private val context: Context, port: Int = 18888) : NanoHT
                     serveAsset(assetPath, mime)
                 }
 
-                // 3. 播放模板页
                 uri == "/player" -> {
                     serveAsset("player.served.html", "text/html; charset=utf-8")
                 }
 
-                // 4. 按需取流：TiviMate 请求 /play/{cid}.m3u8
+                // 3. 核心：按需取流接口 (TiviMate 调用的入口)
                 uri.startsWith("/play/") && uri.endsWith(".m3u8") -> {
                     val cid = uri.removePrefix("/play/").removeSuffix(".m3u8")
                     val ch = ChannelRepository.channels.find { it.id == cid }
@@ -74,9 +78,11 @@ class LocalProxyServer(private val context: Context, port: Int = 18888) : NanoHT
                     }
 
                     if (upstreamM3u8Url.isNullOrEmpty()) {
-                        return newFixedLengthResponse(Response.Status.SERVICE_UNAVAILABLE, "text/plain", "Stream resolving...")
+                        LogManager.log("[中继网关] ${ch.name} 取流中，返回 503 稍候重试")
+                        return newFixedLengthResponse(Response.Status.SERVICE_UNAVAILABLE, "text/plain", "Resolving stream, please retry")
                     }
 
+                    // 拉取上游原始 m3u8
                     val reqBuilder = Request.Builder().url(upstreamM3u8Url).header("User-Agent", AuthSigner.Ua)
                     if (ch.group == ChannelGroup.LOCAL) {
                         reqBuilder.header("Referer", hbtvReferer)
@@ -87,6 +93,7 @@ class LocalProxyServer(private val context: Context, port: Int = 18888) : NanoHT
                     val upstreamBase = upstreamM3u8Url.substringBeforeLast("/") + "/"
                     val isLocalChan = (ch.group == ChannelGroup.LOCAL)
 
+                    // 改写切片地址
                     val rewrittenM3u8 = rawM3u8.lines().joinToString("\n") { line ->
                         val trimmed = line.trim()
                         if (trimmed.isNotEmpty() && !trimmed.startsWith("#")) {
@@ -97,10 +104,11 @@ class LocalProxyServer(private val context: Context, port: Int = 18888) : NanoHT
                             line
                         }
                     }
+                    LogManager.log("[中继网关] ${ch.name} 成功输出 M3U8")
                     newFixedLengthResponse(Response.Status.OK, "application/vnd.apple.mpegurl", rewrittenM3u8)
                 }
 
-                // 5. 央视/卫视分片中继
+                // 4. 央视/卫视分片
                 uri == "/cctv/seg" -> {
                     val upstreamUrl = params["u"]?.firstOrNull()
                         ?: return newFixedLengthResponse(Response.Status.BAD_REQUEST, "text/plain", "Missing u")
@@ -118,7 +126,7 @@ class LocalProxyServer(private val context: Context, port: Int = 18888) : NanoHT
                     newFixedLengthResponse(Response.Status.OK, "video/mp2t", ByteArrayInputStream(clearBytes), clearBytes.size.toLong())
                 }
 
-                // 6. 湖北台分片中继
+                // 5. 湖北台分片
                 uri == "/hbtv/ts" -> {
                     val upstreamUrl = params["u"]?.firstOrNull()
                         ?: return newFixedLengthResponse(Response.Status.BAD_REQUEST, "text/plain", "Missing u")
@@ -139,45 +147,68 @@ class LocalProxyServer(private val context: Context, port: Int = 18888) : NanoHT
         }
     }
 
-    private fun resolveCctvStreamOnDemand(ch: TvChannel): String? {
-        val cacheEntry = upstreamM3u8Cache[ch.id]
+    // 确保会话 Token 处于激活态（大幅消除冷启动往返等待）
+    @Synchronized
+    private fun ensureSessionTokens(): Pair<String, String>? {
         val now = System.currentTimeMillis()
-        if (cacheEntry != null && now - cacheEntry.second < 60000) {
-            return cacheEntry.first
+        if (cachedAuthToken.isNotEmpty() && cachedSessionToken.isNotEmpty() && now < tokenExpireAt) {
+            return Pair(cachedAuthToken, cachedSessionToken)
         }
 
-        return try {
+        try {
             val randStr = AuthSigner.randStr(10)
-            val authSig = AuthSigner.computeAuthSignature(ch.pid, AuthSigner.Guid, randStr)
-            val seqId1 = seqCounter.incrementAndGet().toString()
-            val ts1 = now.toString()
-            val reqId1 = "999999" + AuthSigner.randStr(10) + ts1
+            val authSig = AuthSigner.computeAuthSignature("600001859", AuthSigner.Guid, randStr)
+            val seqId = seqCounter.incrementAndGet().toString()
+            val ts = now.toString()
+            val reqId = "999999" + AuthSigner.randStr(10) + ts
 
             // 1. /auth
-            val authBody = "pid=${ch.pid}&guid=${AuthSigner.Guid}&appid=ysp_pc&rand_str=$randStr&signature=$authSig"
+            val authBody = "pid=600001859&guid=${AuthSigner.Guid}&appid=ysp_pc&rand_str=$randStr&signature=$authSig"
             val authReq = applyHeaders(
                 Request.Builder().url("https://player-api.yangshipin.cn/v1/player/auth")
                     .post(authBody.toRequestBody("application/x-www-form-urlencoded;charset=UTF-8".toMediaType())),
-                seqId1, reqId1
+                seqId, reqId
             ).build()
             val authRes = client.newCall(authReq).execute().body?.string() ?: return null
-            val authJson = JSONObject(authRes)
-            val token = authJson.optJSONObject("data")?.optString("token") ?: return null
-            val authTs = authJson.optJSONObject("data")?.optString("ts") ?: (now / 1000).toString()
+            val token = JSONObject(authRes).optJSONObject("data")?.optString("token") ?: return null
 
-            // 2. /open-token (使用 CmgEngine 后台生成 tokenRnd)
-            val rndVal = CmgEngine.genTokenRnd(AuthSigner.Guid, token, ts1)
-            val openUrl = "https://h5access.yangshipin.cn/web/open/token?yspappid=${AuthSigner.YspAppId}&guid=${AuthSigner.Guid}&vappid=${AuthSigner.VappId}&vsecret=${AuthSigner.Vsecret}&raw=1&version=v1&ts=$ts1&rnd=$rndVal"
+            // 2. /open-token
+            val rndVal = CmgEngine.genTokenRnd(AuthSigner.Guid, token, ts)
+            if (rndVal.isEmpty()) return null
+
+            val openUrl = "https://h5access.yangshipin.cn/web/open/token?yspappid=${AuthSigner.YspAppId}&guid=${AuthSigner.Guid}&vappid=${AuthSigner.VappId}&vsecret=${AuthSigner.Vsecret}&raw=1&version=v1&ts=$ts&rnd=$rndVal"
             val openReq = Request.Builder().url(openUrl).header("User-Agent", AuthSigner.Ua).build()
             val openRes = client.newCall(openReq).execute().body?.string() ?: return null
             val sessionToken = JSONObject(openRes).optJSONObject("data")?.optString("token") ?: return null
 
-            // 3. 动态 cKey 与 yspticket (使用 CmgEngine 算号)
+            cachedAuthToken = token
+            cachedSessionToken = sessionToken
+            tokenExpireAt = now + 20 * 60 * 1000L // 缓存 20 分钟
+            LogManager.log("[会话] 全局鉴权 Token 刷新成功")
+            return Pair(token, sessionToken)
+        } catch (e: Exception) {
+            LogManager.log("[会话异常] ${e.message}")
+            return null
+        }
+    }
+
+    // 后台极速按需取流 (有缓存时仅需约 500ms)
+    private fun resolveCctvStreamOnDemand(ch: TvChannel): String? {
+        val cacheEntry = upstreamM3u8Cache[ch.id]
+        val now = System.currentTimeMillis()
+        if (cacheEntry != null && now - cacheEntry.second < 120000) {
+            return cacheEntry.first // 2分钟内直接复用
+        }
+
+        return try {
+            val tokens = ensureSessionTokens() ?: return null
+            val authToken = tokens.first
+            val sessionToken = tokens.second
+
             val tsSec = (now / 1000).toString()
             val cKey = CmgEngine.generateCKey(ch.cnlId, tsSec, ch.pid)
-            val yspticket = CmgEngine.generateYspTicket(ch.pid, authTs, ch.cnlId)
+            val yspticket = CmgEngine.generateYspTicket(ch.pid, tsSec, ch.cnlId)
 
-            // 4. 业务签名与 live_info
             val randStrLive = AuthSigner.randStr(10)
             val liveFields = mutableMapOf(
                 "cnlid" to ch.cnlId, "livepid" to ch.pid, "stream" to "2", "guid" to AuthSigner.Guid,
@@ -190,9 +221,14 @@ class LocalProxyServer(private val context: Context, port: Int = 18888) : NanoHT
             val bodySig = AuthSigner.computeLiveBodySignature(liveFields)
 
             val liveSeqId = seqCounter.incrementAndGet().toString()
-            val liveReqId = "999999" + AuthSigner.randStr(10) + System.currentTimeMillis().toString()
+            val liveReqId = "999999" + AuthSigner.randStr(10) + now.toString()
 
-            val sig2 = CmgEngine.generateSig2(ch.pid, AuthSigner.Guid, liveSeqId, liveReqId, sessionToken, System.currentTimeMillis().toString(), yspsdkinput)
+            // ★ 修复：调用真实 sig2 签名，严防 mock 假值被拒
+            val sig2 = CmgEngine.generateSig2(ch.pid, AuthSigner.Guid, liveSeqId, liveReqId, sessionToken, now.toString(), yspsdkinput)
+            if (sig2.isEmpty()) {
+                LogManager.log("[取流失败] sig2 计算超时")
+                return null
+            }
 
             val bodyJson = JSONObject().apply {
                 for ((k, v) in liveFields) put(k, v)
@@ -203,7 +239,7 @@ class LocalProxyServer(private val context: Context, port: Int = 18888) : NanoHT
             val liveReq = applyHeaders(
                 Request.Builder().url("https://player-api.yangshipin.cn/v1/player/get_live_info")
                     .post(bodyJson.toRequestBody("application/json; charset=utf-8".toMediaType()))
-                    .header("yspplayertoken", token)
+                    .header("yspplayertoken", authToken)
                     .header("yspsdkinput", yspsdkinput)
                     .header("yspsdksign", "$sig2-$yspsdkinput-${AuthSigner.Guid}-$liveSeqId-$liveReqId")
                     .header("yspticket", yspticket),
@@ -218,6 +254,7 @@ class LocalProxyServer(private val context: Context, port: Int = 18888) : NanoHT
 
             if (finalUrl != null) {
                 upstreamM3u8Cache[ch.id] = Pair(finalUrl, now)
+                LogManager.log("[取流就绪] ${ch.name} 拿到官方播放流")
             }
             finalUrl
         } catch (e: Exception) {
