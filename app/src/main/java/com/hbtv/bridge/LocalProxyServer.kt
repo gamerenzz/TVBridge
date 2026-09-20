@@ -14,24 +14,27 @@ import java.util.concurrent.TimeUnit
 import java.util.concurrent.atomic.AtomicLong
 import java.util.regex.Pattern
 
+data class SessionTokens(
+    val authToken: String,
+    val sessionToken: String,
+    val authTs: String
+)
+
 class LocalProxyServer(private val context: Context, port: Int = 18888) : NanoHTTPD(port) {
 
     private val client = OkHttpClient.Builder()
-        .connectTimeout(8, TimeUnit.SECONDS)
-        .readTimeout(10, TimeUnit.SECONDS)
+        .connectTimeout(12, TimeUnit.SECONDS)
+        .readTimeout(15, TimeUnit.SECONDS)
         .build()
 
     private val seqCounter = AtomicLong(System.currentTimeMillis() / 1000)
     private val hbtvReferer = "https://news.hbtv.com.cn/"
     private val tsPattern = Pattern.compile("^https://live\\d+-cjy\\.hbtv\\.com\\.cn/")
 
-    // m3u8 地址缓存 (有效期 150 秒)
     private val upstreamM3u8Cache = ConcurrentHashMap<String, Pair<String, Long>>()
 
-    // ★ 会话级 Token 缓存（有效期 20 分钟），大幅消除重复 /auth 往返耗时
-    @Volatile private var cachedAuthToken: String = ""
-    @Volatile private var cachedSessionToken: String = ""
-    @Volatile private var tokenExpireAt: Long = 0L
+    @Volatile private var cachedSession: SessionTokens? = null
+    @Volatile private var sessionExpireAt: Long = 0L
 
     override fun serve(session: IHTTPSession): Response {
         val uri = session.uri
@@ -78,11 +81,10 @@ class LocalProxyServer(private val context: Context, port: Int = 18888) : NanoHT
                     }
 
                     if (upstreamM3u8Url.isNullOrEmpty()) {
-                        LogManager.log("[中继网关] ${ch.name} 取流中，返回 503 稍候重试")
+                        LogManager.log("[中继网关] ${ch.name} 取流失败，返回 503")
                         return newFixedLengthResponse(Response.Status.SERVICE_UNAVAILABLE, "text/plain", "Resolving stream, please retry")
                     }
 
-                    // 拉取上游原始 m3u8
                     val reqBuilder = Request.Builder().url(upstreamM3u8Url).header("User-Agent", AuthSigner.Ua)
                     if (ch.group == ChannelGroup.LOCAL) {
                         reqBuilder.header("Referer", hbtvReferer)
@@ -93,7 +95,6 @@ class LocalProxyServer(private val context: Context, port: Int = 18888) : NanoHT
                     val upstreamBase = upstreamM3u8Url.substringBeforeLast("/") + "/"
                     val isLocalChan = (ch.group == ChannelGroup.LOCAL)
 
-                    // 改写切片地址
                     val rewrittenM3u8 = rawM3u8.lines().joinToString("\n") { line ->
                         val trimmed = line.trim()
                         if (trimmed.isNotEmpty() && !trimmed.startsWith("#")) {
@@ -108,7 +109,7 @@ class LocalProxyServer(private val context: Context, port: Int = 18888) : NanoHT
                     newFixedLengthResponse(Response.Status.OK, "application/vnd.apple.mpegurl", rewrittenM3u8)
                 }
 
-                // 4. 央视/卫视分片
+                // 4. 央视/卫视分片中继
                 uri == "/cctv/seg" -> {
                     val upstreamUrl = params["u"]?.firstOrNull()
                         ?: return newFixedLengthResponse(Response.Status.BAD_REQUEST, "text/plain", "Missing u")
@@ -126,7 +127,7 @@ class LocalProxyServer(private val context: Context, port: Int = 18888) : NanoHT
                     newFixedLengthResponse(Response.Status.OK, "video/mp2t", ByteArrayInputStream(clearBytes), clearBytes.size.toLong())
                 }
 
-                // 5. 湖北台分片
+                // 5. 湖北台分片中继
                 uri == "/hbtv/ts" -> {
                     val upstreamUrl = params["u"]?.firstOrNull()
                         ?: return newFixedLengthResponse(Response.Status.BAD_REQUEST, "text/plain", "Missing u")
@@ -147,12 +148,13 @@ class LocalProxyServer(private val context: Context, port: Int = 18888) : NanoHT
         }
     }
 
-    // 确保会话 Token 处于激活态（大幅消除冷启动往返等待）
+    // 确保会话处于激活态并保存 authTs
     @Synchronized
-    private fun ensureSessionTokens(): Pair<String, String>? {
+    private fun ensureSessionTokens(): SessionTokens? {
         val now = System.currentTimeMillis()
-        if (cachedAuthToken.isNotEmpty() && cachedSessionToken.isNotEmpty() && now < tokenExpireAt) {
-            return Pair(cachedAuthToken, cachedSessionToken)
+        val s = cachedSession
+        if (s != null && now < sessionExpireAt) {
+            return s
         }
 
         try {
@@ -164,50 +166,58 @@ class LocalProxyServer(private val context: Context, port: Int = 18888) : NanoHT
 
             // 1. /auth
             val authBody = "pid=600001859&guid=${AuthSigner.Guid}&appid=ysp_pc&rand_str=$randStr&signature=$authSig"
-            val authReq = applyHeaders(
+            val authReq = applyBrowserHeaders(
                 Request.Builder().url("https://player-api.yangshipin.cn/v1/player/auth")
                     .post(authBody.toRequestBody("application/x-www-form-urlencoded;charset=UTF-8".toMediaType())),
                 seqId, reqId
             ).build()
             val authRes = client.newCall(authReq).execute().body?.string() ?: return null
-            val token = JSONObject(authRes).optJSONObject("data")?.optString("token") ?: return null
+            val authJson = JSONObject(authRes)
+            val token = authJson.optJSONObject("data")?.optString("token") ?: return null
+            val authTs = authJson.optJSONObject("data")?.optString("ts") ?: (now / 1000).toString()
 
             // 2. /open-token
             val rndVal = CmgEngine.genTokenRnd(AuthSigner.Guid, token, ts)
             if (rndVal.isEmpty()) return null
 
             val openUrl = "https://h5access.yangshipin.cn/web/open/token?yspappid=${AuthSigner.YspAppId}&guid=${AuthSigner.Guid}&vappid=${AuthSigner.VappId}&vsecret=${AuthSigner.Vsecret}&raw=1&version=v1&ts=$ts&rnd=$rndVal"
-            val openReq = Request.Builder().url(openUrl).header("User-Agent", AuthSigner.Ua).build()
+            val openReq = Request.Builder().url(openUrl)
+                .header("User-Agent", AuthSigner.Ua)
+                .header("Referer", "https://yangshipin.cn/")
+                .header("Origin", "https://yangshipin.cn")
+                .header("Accept", "*/*")
+                .build()
             val openRes = client.newCall(openReq).execute().body?.string() ?: return null
             val sessionToken = JSONObject(openRes).optJSONObject("data")?.optString("token") ?: return null
 
-            cachedAuthToken = token
-            cachedSessionToken = sessionToken
-            tokenExpireAt = now + 20 * 60 * 1000L // 缓存 20 分钟
+            val newSession = SessionTokens(token, sessionToken, authTs)
+            cachedSession = newSession
+            sessionExpireAt = now + 20 * 60 * 1000L
             LogManager.log("[会话] 全局鉴权 Token 刷新成功")
-            return Pair(token, sessionToken)
+            return newSession
         } catch (e: Exception) {
             LogManager.log("[会话异常] ${e.message}")
             return null
         }
     }
 
-    // 后台极速按需取流 (有缓存时仅需约 500ms)
     private fun resolveCctvStreamOnDemand(ch: TvChannel): String? {
         val cacheEntry = upstreamM3u8Cache[ch.id]
         val now = System.currentTimeMillis()
         if (cacheEntry != null && now - cacheEntry.second < 120000) {
-            return cacheEntry.first // 2分钟内直接复用
+            return cacheEntry.first
         }
 
         return try {
-            val tokens = ensureSessionTokens() ?: return null
-            val authToken = tokens.first
-            val sessionToken = tokens.second
+            val session = ensureSessionTokens() ?: return null
+            val authToken = session.authToken
+            val sessionToken = session.sessionToken
+            val authTs = session.authTs
 
             val tsSec = (now / 1000).toString()
             val cKey = CmgEngine.generateCKey(ch.cnlId, tsSec, ch.pid)
-            val yspticket = CmgEngine.generateYspTicket(ch.pid, tsSec, ch.cnlId)
+            // ★ 修复：必须传入 auth 返回的固定 authTs
+            val yspticket = CmgEngine.generateYspTicket(ch.pid, authTs, ch.cnlId)
 
             val randStrLive = AuthSigner.randStr(10)
             val liveFields = mutableMapOf(
@@ -223,7 +233,6 @@ class LocalProxyServer(private val context: Context, port: Int = 18888) : NanoHT
             val liveSeqId = seqCounter.incrementAndGet().toString()
             val liveReqId = "999999" + AuthSigner.randStr(10) + now.toString()
 
-            // ★ 修复：调用真实 sig2 签名，严防 mock 假值被拒
             val sig2 = CmgEngine.generateSig2(ch.pid, AuthSigner.Guid, liveSeqId, liveReqId, sessionToken, now.toString(), yspsdkinput)
             if (sig2.isEmpty()) {
                 LogManager.log("[取流失败] sig2 计算超时")
@@ -236,17 +245,25 @@ class LocalProxyServer(private val context: Context, port: Int = 18888) : NanoHT
                 put("adjust", 1)
             }.toString()
 
-            val liveReq = applyHeaders(
-                Request.Builder().url("https://player-api.yangshipin.cn/v1/player/get_live_info")
-                    .post(bodyJson.toRequestBody("application/json; charset=utf-8".toMediaType()))
-                    .header("yspplayertoken", authToken)
-                    .header("yspsdkinput", yspsdkinput)
-                    .header("yspsdksign", "$sig2-$yspsdkinput-${AuthSigner.Guid}-$liveSeqId-$liveReqId")
-                    .header("yspticket", yspticket),
-                liveSeqId, liveReqId
-            ).build()
+            val liveReqBuilder = Request.Builder()
+                .url("https://player-api.yangshipin.cn/v1/player/get_live_info")
+                .post(bodyJson.toRequestBody("application/json; charset=utf-8".toMediaType()))
+                .header("yspplayertoken", authToken)
+                .header("yspsdkinput", yspsdkinput)
+                .header("yspsdksign", "$sig2-$yspsdkinput-${AuthSigner.Guid}-$liveSeqId-$liveReqId")
+                .header("yspticket", yspticket)
 
-            val liveRes = client.newCall(liveReq).execute().body?.string() ?: return null
+            // ★ 修复：注入与官方网关一致的全套请求头
+            val liveReq = applyBrowserHeaders(liveReqBuilder, liveSeqId, liveReqId).build()
+
+            val liveResp = client.newCall(liveReq).execute()
+            val liveRes = liveResp.body?.string() ?: ""
+
+            if (liveResp.code != 200 || liveRes.isBlank()) {
+                LogManager.log("[取流报错] HTTP ${liveResp.code}, 返回: $liveRes")
+                return null
+            }
+
             val data = JSONObject(liveRes).optJSONObject("data") ?: return null
             val playUrl = data.optString("playurl")
             val ext = data.optString("extended_param", "")
@@ -275,12 +292,22 @@ class LocalProxyServer(private val context: Context, port: Int = 18888) : NanoHT
         }
     }
 
-    private fun applyHeaders(builder: Request.Builder, seqId: String, reqId: String): Request.Builder {
+    // 完整的浏览器级网关防爬头
+    private fun applyBrowserHeaders(builder: Request.Builder, seqId: String, reqId: String): Request.Builder {
         return builder
             .header("User-Agent", AuthSigner.Ua)
             .header("Referer", "https://yangshipin.cn/")
             .header("Origin", "https://yangshipin.cn")
             .header("Accept", "application/json, text/plain, */*")
+            .header("Accept-Language", "zh-CN,zh;q=0.9,en-US;q=0.8,en;q=0.7")
+            .header("Cache-Control", "no-cache")
+            .header("Pragma", "no-cache")
+            .header("sec-ch-ua", "\"Not;A=Brand\";v=\"8\", \"Chromium\";v=\"150\", \"Google Chrome\";v=\"150\"")
+            .header("sec-ch-ua-mobile", "?0")
+            .header("sec-ch-ua-platform", "\"Windows\"")
+            .header("sec-fetch-dest", "empty")
+            .header("sec-fetch-mode", "cors")
+            .header("sec-fetch-site", "same-site")
             .header("yspappid", AuthSigner.YspAppId)
             .header("seqid", seqId)
             .header("request-id", reqId)
