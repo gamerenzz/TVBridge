@@ -10,6 +10,7 @@ import android.view.View
 import android.view.ViewGroup
 import android.webkit.*
 import android.widget.Button
+import android.widget.ScrollView
 import android.widget.TextView
 import androidx.appcompat.app.AppCompatActivity
 import androidx.recyclerview.widget.LinearLayoutManager
@@ -46,12 +47,13 @@ object LogManager {
 
     fun log(msg: String) {
         val entry = "[${sdf.format(Date())}] $msg"
-        if (logList.size > 100) logList.removeAt(0)
+        if (logList.size > 200) logList.removeAt(0)
         logList.add(entry)
         onLogListener?.invoke(entry)
     }
 
     fun getAllLogs(): String = logList.joinToString("\n")
+    fun clear() = logList.clear()
 }
 
 class MainActivity : AppCompatActivity() {
@@ -60,14 +62,17 @@ class MainActivity : AppCompatActivity() {
     private lateinit var tvCurrentPlaying: TextView
     private lateinit var channelDrawer: View
     private lateinit var rvChannels: RecyclerView
+    private lateinit var logOverlay: View
+    private lateinit var tvConsoleLogs: TextView
+    private lateinit var logScrollView: ScrollView
 
     private var currentGroup = ChannelGroup.CCTV
     private lateinit var adapter: ChannelAdapter
     private var currentChannelIndex = 0
 
     private val httpClient = OkHttpClient.Builder()
-        .connectTimeout(15, TimeUnit.SECONDS)
-        .readTimeout(20, TimeUnit.SECONDS)
+        .connectTimeout(12, TimeUnit.SECONDS)
+        .readTimeout(15, TimeUnit.SECONDS)
         .build()
 
     private var tokenRndFuture: SyncValue<String>? = null
@@ -77,20 +82,42 @@ class MainActivity : AppCompatActivity() {
         super.onCreate(savedInstanceState)
         setContentView(R.layout.activity_main)
 
-        // 1. 【核心修复】必须在最前置同步启动本地 NanoHTTPD 服务器，确保 18888 端口处于监听状态
         ServerManager.start(this)
 
         playerWebView = findViewById(R.id.playerWebView)
         tvCurrentPlaying = findViewById(R.id.tvCurrentPlaying)
         channelDrawer = findViewById(R.id.channelDrawer)
         rvChannels = findViewById(R.id.rvChannels)
+        logOverlay = findViewById(R.id.logOverlay)
+        tvConsoleLogs = findViewById(R.id.tvConsoleLogs)
+        logScrollView = findViewById(R.id.logScrollView)
 
         val btnToggleDrawer = findViewById<Button>(R.id.btnToggleDrawer)
+        val btnToggleLogs = findViewById<Button>(R.id.btnToggleLogs)
+        val btnClearLogs = findViewById<TextView>(R.id.btnClearLogs)
+        val btnCloseLogs = findViewById<TextView>(R.id.btnCloseLogs)
+
         val tabCctv = findViewById<Button>(R.id.tabCctv)
         val tabSatellite = findViewById<Button>(R.id.tabSatellite)
         val tabLocal = findViewById<Button>(R.id.tabLocal)
 
-        // 2. 尝试启动保活服务（即使通知权限被拒也不阻碍主页面）
+        // 实时日志监听回显
+        LogManager.onLogListener = {
+            runOnUiThread {
+                tvConsoleLogs.text = LogManager.getAllLogs()
+                logScrollView.post { logScrollView.fullScroll(ScrollView.FOCUS_DOWN) }
+            }
+        }
+
+        btnToggleLogs.setOnClickListener {
+            logOverlay.visibility = if (logOverlay.visibility == View.VISIBLE) View.GONE else View.VISIBLE
+        }
+        btnCloseLogs.setOnClickListener { logOverlay.visibility = View.GONE }
+        btnClearLogs.setOnClickListener {
+            LogManager.clear()
+            tvConsoleLogs.text = ""
+        }
+
         try {
             val intent = Intent(this, BridgeService::class.java)
             if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
@@ -105,7 +132,6 @@ class MainActivity : AppCompatActivity() {
         val hiddenContainer = findViewById<ViewGroup>(R.id.hiddenWebContainer)
         WebViewKeeper.init(this, hiddenContainer)
 
-        // 3. 初始化播放器
         initPlayerWebView()
 
         rvChannels.layoutManager = LinearLayoutManager(this)
@@ -143,11 +169,24 @@ class MainActivity : AppCompatActivity() {
             cacheMode = WebSettings.LOAD_NO_CACHE
         }
 
+        // 捕获页面内部的 console.log 和报错，输出到终端
+        playerWebView.webChromeClient = object : WebChromeClient() {
+            override fun onConsoleMessage(consoleMessage: ConsoleMessage?): Boolean {
+                consoleMessage?.let {
+                    LogManager.log("[JS] ${it.message()}")
+                }
+                return true
+            }
+        }
+
         playerWebView.addJavascriptInterface(object {
             @JavascriptInterface
             fun postMessage(jsonStr: String) {
                 try {
                     val obj = JSONObject(jsonStr)
+                    if (obj.has("log")) {
+                        LogManager.log("[CMG] ${obj.getString("log")}")
+                    }
                     if (obj.has("tokenRnd")) {
                         tokenRndFuture?.set(obj.getString("tokenRnd"))
                     }
@@ -167,8 +206,8 @@ class MainActivity : AppCompatActivity() {
 
         playerWebView.webViewClient = object : WebViewClient() {
             override fun onPageFinished(view: WebView?, url: String?) {
-                // 如果是加载了 player 页面才注入并播放
                 if (url != null && url.contains("18888/player")) {
+                    LogManager.log("player.served.html 加载成功")
                     val polyfill = """
                         if (!window.chrome) window.chrome = {};
                         if (!window.chrome.webview) {
@@ -186,8 +225,8 @@ class MainActivity : AppCompatActivity() {
             }
 
             override fun onReceivedError(view: WebView?, request: WebResourceRequest?, error: WebResourceError?) {
-                // 如果因为并发原因被拒绝，延迟 500ms 自动重试一次
                 if (request?.isForMainFrame == true) {
+                    LogManager.log("WebView 主框架加载失败，500ms 后重试...")
                     playerWebView.postDelayed({
                         playerWebView.loadUrl("http://127.0.0.1:18888/player")
                     }, 500)
@@ -195,10 +234,9 @@ class MainActivity : AppCompatActivity() {
             }
         }
 
-        // 延迟 100ms 加载，确保 Socket 彻底就绪
         playerWebView.postDelayed({
             playerWebView.loadUrl("http://127.0.0.1:18888/player")
-        }, 100)
+        }, 150)
     }
 
     private fun getFilteredChannels(): List<TvChannel> {
@@ -206,7 +244,8 @@ class MainActivity : AppCompatActivity() {
     }
 
     private fun playChannel(ch: TvChannel) {
-        tvCurrentPlaying.text = "${ch.name} (加载中...)"
+        tvCurrentPlaying.text = "${ch.name} (鉴权取流中...)"
+        LogManager.log("▶ 开始取流: ${ch.name} (pid=${ch.pid})")
 
         if (ch.group == ChannelGroup.LOCAL) {
             val localM3u8 = "http://127.0.0.1:18888/hbtv/${ch.id}.m3u8"
@@ -220,20 +259,24 @@ class MainActivity : AppCompatActivity() {
                 val m3u8 = fetchCctvM3u8(ch)
                 runOnUiThread {
                     if (m3u8 != null) {
+                        LogManager.log("取流成功，喂入播放器: ${m3u8.take(50)}...")
                         startHlsPlay(m3u8)
-                        tvCurrentPlaying.text = "${ch.name} (CMG 解密播放中)"
+                        tvCurrentPlaying.text = "${ch.name} (解密播放中)"
                     } else {
-                        tvCurrentPlaying.text = "${ch.name} (获取播放流失败)"
+                        tvCurrentPlaying.text = "${ch.name} (未获取到地址)"
+                        LogManager.log("获取播放地址失败")
                     }
                 }
             } catch (e: Exception) {
                 runOnUiThread {
                     tvCurrentPlaying.text = "${ch.name} 错误: ${e.message}"
+                    LogManager.log("异常报错: ${e.message}")
                 }
             }
         }.start()
     }
 
+    // ★ 关键重构：直连官方网关，不再绕道本地代理
     private fun fetchCctvM3u8(ch: TvChannel): String? {
         val randStr = AuthSigner.randStr(10)
         val authSig = AuthSigner.computeAuthSignature(ch.pid, AuthSigner.Guid, randStr)
@@ -241,28 +284,51 @@ class MainActivity : AppCompatActivity() {
         val ts = System.currentTimeMillis().toString()
         val reqId = "999999" + AuthSigner.randStr(10) + ts
 
-        // 1. POST /auth
+        // 1. POST 直连 https://player-api.yangshipin.cn/v1/player/auth
+        LogManager.log("1. 请求 /auth 鉴权...")
         val authBody = "pid=${ch.pid}&guid=${AuthSigner.Guid}&appid=ysp_pc&rand_str=$randStr&signature=$authSig"
-        val authReq = Request.Builder().url("http://127.0.0.1:18888/auth")
+        val authReq = Request.Builder()
+            .url("https://player-api.yangshipin.cn/v1/player/auth")
             .post(authBody.toRequestBody("application/x-www-form-urlencoded".toMediaType()))
+            .header("User-Agent", AuthSigner.Ua)
+            .header("Referer", "https://yangshipin.cn/")
+            .header("Origin", "https://yangshipin.cn")
+            .header("Cookie", AuthSigner.Cookie)
             .build()
-        val authRes = httpClient.newCall(authReq).execute().body?.string() ?: return null
+
+        val authResp = httpClient.newCall(authReq).execute()
+        val authRes = authResp.body?.string() ?: ""
+        LogManager.log("auth 返回 [HTTP ${authResp.code}]: ${authRes.take(70)}...")
+        if (authResp.code != 200 || authRes.isEmpty()) return null
+
         val authJson = JSONObject(authRes)
         val token = authJson.optJSONObject("data")?.optString("token") ?: return null
         val authTs = authJson.optJSONObject("data")?.optString("ts") ?: (System.currentTimeMillis() / 1000).toString()
 
-        // 2. JS 算 tokenRnd -> GET /open-token
+        // 2. JS 算 tokenRnd -> GET 直连 /web/open/token
+        LogManager.log("2. 计算 tokenRnd 并换取 sessionToken...")
         tokenRndFuture = SyncValue()
         runOnUiThread {
             playerWebView.evaluateJavascript("window.__genTokenRnd('${AuthSigner.Guid}', '$token', '$ts')", null)
         }
-        val rndVal = tokenRndFuture?.get(8, TimeUnit.SECONDS) ?: return null
+        val rndVal = tokenRndFuture?.get(8, TimeUnit.SECONDS) ?: run {
+            LogManager.log("tokenRnd 计算超时")
+            return null
+        }
 
-        val openUrl = "http://127.0.0.1:18888/open-token?yspappid=${AuthSigner.YspAppId}&guid=${AuthSigner.Guid}&vappid=${AuthSigner.VappId}&vsecret=${AuthSigner.Vsecret}&raw=1&version=v1&ts=$ts&rnd=$rndVal"
-        val openRes = httpClient.newCall(Request.Builder().url(openUrl).build()).execute().body?.string() ?: return null
+        val openUrl = "https://h5access.yangshipin.cn/web/open/token?yspappid=${AuthSigner.YspAppId}&guid=${AuthSigner.Guid}&vappid=${AuthSigner.VappId}&vsecret=${AuthSigner.Vsecret}&raw=1&version=v1&ts=$ts&rnd=$rndVal"
+        val openReq = Request.Builder().url(openUrl)
+            .header("User-Agent", AuthSigner.Ua)
+            .header("Referer", "https://yangshipin.cn/")
+            .header("Origin", "https://yangshipin.cn")
+            .build()
+        val openResp = httpClient.newCall(openReq).execute()
+        val openRes = openResp.body?.string() ?: ""
+        LogManager.log("openToken 返回 [HTTP ${openResp.code}]: ${openRes.take(70)}...")
         val sessionToken = JSONObject(openRes).optJSONObject("data")?.optString("token") ?: return null
 
-        // 3. 动态 cKey
+        // 3. 动态 cKey (调用页面内 fb15 webpack 模块)
+        LogManager.log("3. 生成 324位 cKey...")
         val cKeyFuture = SyncValue<String>()
         val safeUrl = "https://yangshipin.cn/tv/home?pid=${ch.pid}"
         val tsSec = (System.currentTimeMillis() / 1000).toString()
@@ -274,7 +340,8 @@ class MainActivity : AppCompatActivity() {
         }
         val cKey = cKeyFuture.get(5, TimeUnit.SECONDS) ?: ""
 
-        // 4. 动态 yspticket
+        // 4. 动态 yspticket (调用页面内 RJq7sO71JF.wasm)
+        LogManager.log("4. 生成 yspticket...")
         val ticketFuture = SyncValue<String>()
         runOnUiThread {
             playerWebView.evaluateJavascript("window.__genYspTicket('${ch.pid}', '$authTs', '${ch.cnlId}', '${AuthSigner.Guid}', '${AuthSigner.YspAppId}', 'V1.0.0')") { res ->
@@ -296,14 +363,19 @@ class MainActivity : AppCompatActivity() {
         val yspsdkinput = AuthSigner.computeLiveSdkInput(liveFields)
         val bodySig = AuthSigner.computeLiveBodySignature(liveFields)
 
-        // 6. 生成 sig2
+        // 6. 算 sig2
+        LogManager.log("5. 计算 sig2 签名...")
         signatureFuture = SyncValue()
         runOnUiThread {
             playerWebView.evaluateJavascript("window.__generateSignature('${ch.pid}','${AuthSigner.Guid}','$seqId','$reqId','$sessionToken','$ts','$yspsdkinput')", null)
         }
-        val sig2 = signatureFuture?.get(8, TimeUnit.SECONDS) ?: return null
+        val sig2 = signatureFuture?.get(8, TimeUnit.SECONDS) ?: run {
+            LogManager.log("sig2 计算超时")
+            return null
+        }
 
-        // 7. POST /get-live-info
+        // 7. POST 直连 https://player-api.yangshipin.cn/v1/player/get_live_info
+        LogManager.log("6. 请求 get_live_info 获取直播流...")
         val bodyJson = JSONObject().apply {
             for ((k, v) in liveFields) {
                 put(k, v)
@@ -312,7 +384,8 @@ class MainActivity : AppCompatActivity() {
             put("adjust", 1)
         }.toString()
 
-        val liveReq = Request.Builder().url("http://127.0.0.1:18888/get-live-info")
+        val liveReq = Request.Builder()
+            .url("https://player-api.yangshipin.cn/v1/player/get_live_info")
             .post(bodyJson.toRequestBody("application/json; charset=utf-8".toMediaType()))
             .header("yspappid", AuthSigner.YspAppId)
             .header("yspplayertoken", token)
@@ -321,10 +394,16 @@ class MainActivity : AppCompatActivity() {
             .header("yspticket", yspticket)
             .header("request-id", reqId)
             .header("seqid", seqId)
-            .header("Cookie", AuthSigner.Cookie)
+            .header("Cookie", AuthSigner.Cookie + " nseqId=$seqId; nrequest-id=$reqId")
+            .header("User-Agent", AuthSigner.Ua)
+            .header("Referer", "https://yangshipin.cn/")
+            .header("Origin", "https://yangshipin.cn")
             .build()
 
-        val liveRes = httpClient.newCall(liveReq).execute().body?.string() ?: return null
+        val liveResp = httpClient.newCall(liveReq).execute()
+        val liveRes = liveResp.body?.string() ?: ""
+        LogManager.log("get_live_info 返回 [HTTP ${liveResp.code}]: ${liveRes.take(70)}...")
+
         val data = JSONObject(liveRes).optJSONObject("data") ?: return null
         val playUrl = data.optString("playurl")
         val ext = data.optString("extended_param", "")
@@ -356,6 +435,10 @@ class MainActivity : AppCompatActivity() {
                 return true
             }
             KeyEvent.KEYCODE_BACK -> {
+                if (logOverlay.visibility == View.VISIBLE) {
+                    logOverlay.visibility = View.GONE
+                    return true
+                }
                 if (channelDrawer.visibility == View.VISIBLE) {
                     channelDrawer.visibility = View.GONE
                     return true
