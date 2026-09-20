@@ -24,6 +24,7 @@ import java.util.*
 import java.util.concurrent.CopyOnWriteArrayList
 import java.util.concurrent.CountDownLatch
 import java.util.concurrent.TimeUnit
+import java.util.concurrent.atomic.AtomicLong
 
 class SyncValue<T> {
     private val latch = CountDownLatch(1)
@@ -70,6 +71,9 @@ class MainActivity : AppCompatActivity() {
     private lateinit var adapter: ChannelAdapter
     private var currentChannelIndex = 0
 
+    // 单调递增的序号，防止被服务器风控拒绝
+    private val seqCounter = AtomicLong(System.currentTimeMillis() / 1000)
+
     private val httpClient = OkHttpClient.Builder()
         .connectTimeout(12, TimeUnit.SECONDS)
         .readTimeout(15, TimeUnit.SECONDS)
@@ -101,7 +105,6 @@ class MainActivity : AppCompatActivity() {
         val tabSatellite = findViewById<Button>(R.id.tabSatellite)
         val tabLocal = findViewById<Button>(R.id.tabLocal)
 
-        // 实时日志监听回显
         LogManager.onLogListener = {
             runOnUiThread {
                 tvConsoleLogs.text = LogManager.getAllLogs()
@@ -169,7 +172,6 @@ class MainActivity : AppCompatActivity() {
             cacheMode = WebSettings.LOAD_NO_CACHE
         }
 
-        // 捕获页面内部的 console.log 和报错，输出到终端
         playerWebView.webChromeClient = object : WebChromeClient() {
             override fun onConsoleMessage(consoleMessage: ConsoleMessage?): Boolean {
                 consoleMessage?.let {
@@ -226,7 +228,6 @@ class MainActivity : AppCompatActivity() {
 
             override fun onReceivedError(view: WebView?, request: WebResourceRequest?, error: WebResourceError?) {
                 if (request?.isForMainFrame == true) {
-                    LogManager.log("WebView 主框架加载失败，500ms 后重试...")
                     playerWebView.postDelayed({
                         playerWebView.loadUrl("http://127.0.0.1:18888/player")
                     }, 500)
@@ -259,7 +260,7 @@ class MainActivity : AppCompatActivity() {
                 val m3u8 = fetchCctvM3u8(ch)
                 runOnUiThread {
                     if (m3u8 != null) {
-                        LogManager.log("取流成功，喂入播放器: ${m3u8.take(50)}...")
+                        LogManager.log("取流成功，喂入播放器")
                         startHlsPlay(m3u8)
                         tvCurrentPlaying.text = "${ch.name} (解密播放中)"
                     } else {
@@ -276,25 +277,44 @@ class MainActivity : AppCompatActivity() {
         }.start()
     }
 
-    // ★ 关键重构：直连官方网关，不再绕道本地代理
-    private fun fetchCctvM3u8(ch: TvChannel): String? {
-        val randStr = AuthSigner.randStr(10)
-        val authSig = AuthSigner.computeAuthSignature(ch.pid, AuthSigner.Guid, randStr)
-        val seqId = (System.currentTimeMillis() % 100000000).toString()
-        val ts = System.currentTimeMillis().toString()
-        val reqId = "999999" + AuthSigner.randStr(10) + ts
-
-        // 1. POST 直连 https://player-api.yangshipin.cn/v1/player/auth
-        LogManager.log("1. 请求 /auth 鉴权...")
-        val authBody = "pid=${ch.pid}&guid=${AuthSigner.Guid}&appid=ysp_pc&rand_str=$randStr&signature=$authSig"
-        val authReq = Request.Builder()
-            .url("https://player-api.yangshipin.cn/v1/player/auth")
-            .post(authBody.toRequestBody("application/x-www-form-urlencoded".toMediaType()))
+    // 注入与官方 APISIX 网关完全匹配的浏览器级请求头
+    private fun applyBrowserHeaders(builder: Request.Builder, seqId: String, reqId: String): Request.Builder {
+        return builder
             .header("User-Agent", AuthSigner.Ua)
             .header("Referer", "https://yangshipin.cn/")
             .header("Origin", "https://yangshipin.cn")
-            .header("Cookie", AuthSigner.Cookie)
-            .build()
+            .header("Accept", "application/json, text/plain, */*")
+            .header("Accept-Language", "zh-CN,zh;q=0.9,en-US;q=0.8,en;q=0.7")
+            .header("Cache-Control", "no-cache")
+            .header("Pragma", "no-cache")
+            .header("sec-ch-ua", "\"Not;A=Brand\";v=\"8\", \"Chromium\";v=\"150\", \"Google Chrome\";v=\"150\"")
+            .header("sec-ch-ua-mobile", "?0")
+            .header("sec-ch-ua-platform", "\"Windows\"")
+            .header("sec-fetch-dest", "empty")
+            .header("sec-fetch-mode", "cors")
+            .header("sec-fetch-site", "same-site")
+            .header("yspappid", AuthSigner.YspAppId)
+            .header("seqid", seqId)
+            .header("request-id", reqId)
+            .header("Cookie", "${AuthSigner.Cookie} nseqId=$seqId; nrequest-id=$reqId")
+    }
+
+    private fun fetchCctvM3u8(ch: TvChannel): String? {
+        val randStr = AuthSigner.randStr(10)
+        val authSig = AuthSigner.computeAuthSignature(ch.pid, AuthSigner.Guid, randStr)
+        val seqId = seqCounter.incrementAndGet().toString()
+        val ts = System.currentTimeMillis().toString()
+        val reqId = "999999" + AuthSigner.randStr(10) + ts
+
+        // 1. POST /v1/player/auth (带全套网关指纹头)
+        LogManager.log("1. 请求 /auth 鉴权...")
+        val authBody = "pid=${ch.pid}&guid=${AuthSigner.Guid}&appid=ysp_pc&rand_str=$randStr&signature=$authSig"
+        val authReq = applyBrowserHeaders(
+            Request.Builder()
+                .url("https://player-api.yangshipin.cn/v1/player/auth")
+                .post(authBody.toRequestBody("application/x-www-form-urlencoded;charset=UTF-8".toMediaType())),
+            seqId, reqId
+        ).build()
 
         val authResp = httpClient.newCall(authReq).execute()
         val authRes = authResp.body?.string() ?: ""
@@ -305,7 +325,7 @@ class MainActivity : AppCompatActivity() {
         val token = authJson.optJSONObject("data")?.optString("token") ?: return null
         val authTs = authJson.optJSONObject("data")?.optString("ts") ?: (System.currentTimeMillis() / 1000).toString()
 
-        // 2. JS 算 tokenRnd -> GET 直连 /web/open/token
+        // 2. JS 生成 tokenRnd -> GET /web/open/token
         LogManager.log("2. 计算 tokenRnd 并换取 sessionToken...")
         tokenRndFuture = SyncValue()
         runOnUiThread {
@@ -321,6 +341,7 @@ class MainActivity : AppCompatActivity() {
             .header("User-Agent", AuthSigner.Ua)
             .header("Referer", "https://yangshipin.cn/")
             .header("Origin", "https://yangshipin.cn")
+            .header("Accept", "*/*")
             .build()
         val openResp = httpClient.newCall(openReq).execute()
         val openRes = openResp.body?.string() ?: ""
@@ -374,7 +395,7 @@ class MainActivity : AppCompatActivity() {
             return null
         }
 
-        // 7. POST 直连 https://player-api.yangshipin.cn/v1/player/get_live_info
+        // 7. POST /v1/player/get_live_info
         LogManager.log("6. 请求 get_live_info 获取直播流...")
         val bodyJson = JSONObject().apply {
             for ((k, v) in liveFields) {
@@ -384,21 +405,18 @@ class MainActivity : AppCompatActivity() {
             put("adjust", 1)
         }.toString()
 
-        val liveReq = Request.Builder()
+        val seqId2 = seqCounter.incrementAndGet().toString()
+        val reqId2 = "999999" + AuthSigner.randStr(10) + System.currentTimeMillis().toString()
+
+        val liveReqBuilder = Request.Builder()
             .url("https://player-api.yangshipin.cn/v1/player/get_live_info")
             .post(bodyJson.toRequestBody("application/json; charset=utf-8".toMediaType()))
-            .header("yspappid", AuthSigner.YspAppId)
             .header("yspplayertoken", token)
             .header("yspsdkinput", yspsdkinput)
-            .header("yspsdksign", "$sig2-$yspsdkinput-${AuthSigner.Guid}-$seqId-$reqId")
+            .header("yspsdksign", "$sig2-$yspsdkinput-${AuthSigner.Guid}-$seqId2-$reqId2")
             .header("yspticket", yspticket)
-            .header("request-id", reqId)
-            .header("seqid", seqId)
-            .header("Cookie", AuthSigner.Cookie + " nseqId=$seqId; nrequest-id=$reqId")
-            .header("User-Agent", AuthSigner.Ua)
-            .header("Referer", "https://yangshipin.cn/")
-            .header("Origin", "https://yangshipin.cn")
-            .build()
+
+        val liveReq = applyBrowserHeaders(liveReqBuilder, seqId2, reqId2).build()
 
         val liveResp = httpClient.newCall(liveReq).execute()
         val liveRes = liveResp.body?.string() ?: ""
