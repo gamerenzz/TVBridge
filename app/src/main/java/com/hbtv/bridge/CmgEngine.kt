@@ -28,7 +28,7 @@ object CmgEngine {
 
         mainHandler.post {
             try {
-                LogManager.log("[CmgEngine] 启动后台无头计算内核...")
+                LogManager.log("[CmgEngine] 启动后台计算内核...")
                 headLessWebView = WebView(context.applicationContext).apply {
                     settings.javaScriptEnabled = true
                     settings.domStorageEnabled = true
@@ -72,7 +72,7 @@ object CmgEngine {
                             """.trimIndent()
                             evaluateJavascript(polyfill, null)
                             isInitialized = true
-                            LogManager.log("[CmgEngine] 计算内核就绪 (18888/player)")
+                            LogManager.log("[CmgEngine] 内核就绪 (18888/player)")
                         }
                     }
 
@@ -93,7 +93,7 @@ object CmgEngine {
         mainHandler.post {
             headLessWebView?.evaluateJavascript("window.__genTokenRnd('$guid', '$token', '$ts');", null)
         }
-        tokenRndLatch?.await(6, TimeUnit.SECONDS)
+        tokenRndLatch?.await(5, TimeUnit.SECONDS)
         return tokenRndVal
     }
 
@@ -108,11 +108,11 @@ object CmgEngine {
                 latch.countDown()
             }
         }
-        latch.await(6, TimeUnit.SECONDS)
+        latch.await(5, TimeUnit.SECONDS)
         return res
     }
 
-    // 生成 yspticket (必须使用 /auth 返回的 authTs)
+    // 生成 yspticket
     fun generateYspTicket(pid: String, authTs: String, cnlId: String): String {
         val latch = CountDownLatch(1)
         var res = ""
@@ -122,7 +122,7 @@ object CmgEngine {
                 latch.countDown()
             }
         }
-        latch.await(6, TimeUnit.SECONDS)
+        latch.await(5, TimeUnit.SECONDS)
         return res
     }
 
@@ -133,7 +133,7 @@ object CmgEngine {
         mainHandler.post {
             headLessWebView?.evaluateJavascript("window.__generateSignature('$pid','$guid','$seqId','$reqId','$sessionToken','$ts','$yspsdkinput');", null)
         }
-        sig2Latch?.await(6, TimeUnit.SECONDS)
+        sig2Latch?.await(5, TimeUnit.SECONDS)
         return sig2Val
     }
 
