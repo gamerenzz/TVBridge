@@ -2,8 +2,9 @@ package com.hbtv.bridge
 
 import android.content.Context
 import fi.iki.elonen.NanoHTTPD
-import okhttp3.*
 import okhttp3.MediaType.Companion.toMediaType
+import okhttp3.OkHttpClient
+import okhttp3.Request
 import okhttp3.RequestBody.Companion.toRequestBody
 import java.io.ByteArrayInputStream
 import java.io.InputStream
@@ -33,7 +34,7 @@ class LocalProxyServer(private val context: Context, port: Int = 18888) : NanoHT
                     serveAsset("player.served.html", "text/html; charset=utf-8")
                 }
 
-                // 2. 静态解密资产文件托管 (cmg.slim.js, reloc_table.bin, eb_prog.bin, hls.cmg.js)
+                // 2. 静态解密资产文件托管
                 uri.startsWith("/sapi/") -> {
                     val filename = uri.removePrefix("/sapi/")
                     val assetPath = "sapi_cache/$filename"
@@ -49,13 +50,13 @@ class LocalProxyServer(private val context: Context, port: Int = 18888) : NanoHT
                     proxyPost("https://player-api.yangshipin.cn/v1/player/auth", postData, "application/x-www-form-urlencoded")
                 }
 
-                // 4. /open-token 会话 Token 代理
+                // 4. /open-token 代理
                 uri == "/open-token" && method == Method.GET -> {
                     val query = session.queryParameterString ?: ""
                     proxyGet("https://h5access.yangshipin.cn/web/open/token?$query")
                 }
 
-                // 5. /get-live-info 直播地址获取代理
+                // 5. /get-live-info 代理
                 uri == "/get-live-info" && method == Method.POST -> {
                     val map = HashMap<String, String>()
                     session.parseBody(map)
@@ -69,9 +70,10 @@ class LocalProxyServer(private val context: Context, port: Int = 18888) : NanoHT
                     proxyGet(targetUrl)
                 }
 
-                // 7. 湖北台 TS 防盗链分片中继
+                // 7. 湖北台 TS 分片代理
                 uri == "/hbtv/ts" -> {
-                    val upstreamUrl = params["u"]?.firstOrNull() ?: return newFixedLengthResponse(Response.Status.BAD_REQUEST, "text/plain", "Missing u")
+                    val upstreamUrl = params["u"]?.firstOrNull()
+                        ?: return newFixedLengthResponse(Response.Status.BAD_REQUEST, "text/plain", "Missing u")
                     if (!tsPattern.matcher(upstreamUrl).find()) {
                         return newFixedLengthResponse(Response.Status.FORBIDDEN, "text/plain", "Bad host")
                     }
@@ -127,7 +129,7 @@ class LocalProxyServer(private val context: Context, port: Int = 18888) : NanoHT
                 else -> newFixedLengthResponse(Response.Status.NOT_FOUND, "text/plain", "Not Found")
             }
         } catch (e: Exception) {
-            LogManager.log("代理异常 [${session.uri}]: ${e.message}")
+            LogManager.log("代理异常: ${e.message}")
             newFixedLengthResponse(Response.Status.INTERNAL_ERROR, "text/plain", e.message)
         }
     }
@@ -144,6 +146,13 @@ class LocalProxyServer(private val context: Context, port: Int = 18888) : NanoHT
         }
     }
 
+    private fun makeStatus(code: Int, desc: String): Response.IStatus {
+        return object : Response.IStatus {
+            override fun getRequestStatus(): Int = code
+            override fun getDescription(): String = "$code $desc"
+        }
+    }
+
     private fun proxyGet(url: String): Response {
         val req = Request.Builder().url(url)
             .header("User-Agent", AuthSigner.Ua)
@@ -152,7 +161,8 @@ class LocalProxyServer(private val context: Context, port: Int = 18888) : NanoHT
             .build()
         val resp = client.newCall(req).execute()
         val body = resp.body?.string() ?: ""
-        val r = newFixedLengthResponse(Response.Status.lookup(resp.code), resp.header("Content-Type", "application/json"), body)
+        val contentType = resp.header("Content-Type") ?: "application/json"
+        val r = newFixedLengthResponse(makeStatus(resp.code, resp.message), contentType, body)
         r.addHeader("Access-Control-Allow-Origin", "*")
         return r
     }
@@ -168,7 +178,7 @@ class LocalProxyServer(private val context: Context, port: Int = 18888) : NanoHT
             .build()
         val resp = client.newCall(req).execute()
         val resStr = resp.body?.string() ?: ""
-        val r = newFixedLengthResponse(Response.Status.lookup(resp.code), "application/json; charset=utf-8", resStr)
+        val r = newFixedLengthResponse(makeStatus(resp.code, resp.message), "application/json; charset=utf-8", resStr)
         r.addHeader("Access-Control-Allow-Origin", "*")
         return r
     }
@@ -186,7 +196,7 @@ class LocalProxyServer(private val context: Context, port: Int = 18888) : NanoHT
         builder.header("Origin", "https://yangshipin.cn")
         val resp = client.newCall(builder.build()).execute()
         val resStr = resp.body?.string() ?: ""
-        val r = newFixedLengthResponse(Response.Status.lookup(resp.code), "application/json; charset=utf-8", resStr)
+        val r = newFixedLengthResponse(makeStatus(resp.code, resp.message), "application/json; charset=utf-8", resStr)
         r.addHeader("Access-Control-Allow-Origin", "*")
         return r
     }
