@@ -11,8 +11,8 @@ android {
         applicationId "com.hbtv.bridge"
         minSdk 21
         targetSdk 33
-        versionCode 1
-        versionName "1.1.0"
+        versionCode 2
+        versionName "2.0.0"
     }
 
     buildTypes {
@@ -34,10 +34,11 @@ dependencies {
     implementation 'androidx.core:core-ktx:1.12.0'
     implementation 'androidx.appcompat:appcompat:1.6.1'
     implementation 'com.google.android.material:material:1.11.0'
-    implementation 'androidx.recyclerview:recyclerview:1.3.2'
-    implementation 'androidx.cardview:cardview:1.0.0'
 
-    // 本地 HTTP 服务器 (NanoHTTPD) 与网络请求 (OkHttp)
+    // 核心：超轻量 QuickJS 引擎，替代庞大的 WebView 进行后台算号与逻辑派发
+    implementation 'com.github.whoshuu:quickjs-android:0.9.0'
+
+    // 本地 HTTP 服务器与网络下载
     implementation 'org.nanohttpd:nanohttpd:2.3.1'
     implementation 'com.squareup.okhttp3:okhttp:4.12.0'
 }
