@@ -1,57 +1,30 @@
 package com.hbtv.bridge
 
 import android.annotation.SuppressLint
-import android.app.*
-import android.content.ClipData
-import android.content.ClipboardManager
-import android.content.Context
 import android.content.Intent
-import android.net.http.SslError
 import android.os.Build
 import android.os.Bundle
-import android.os.Handler
-import android.os.IBinder
-import android.os.Looper
+import android.view.KeyEvent
+import android.view.LayoutInflater
+import android.view.View
 import android.view.ViewGroup
 import android.webkit.*
 import android.widget.Button
-import android.widget.ScrollView
 import android.widget.TextView
-import android.widget.Toast
 import androidx.appcompat.app.AppCompatActivity
-import androidx.core.app.NotificationCompat
-import com.hbtv.bridge.R
-import fi.iki.elonen.NanoHTTPD
-import okhttp3.OkHttpClient
-import okhttp3.Request
-import java.io.ByteArrayInputStream
-import java.net.URLEncoder
+import androidx.recyclerview.widget.LinearLayoutManager
+import androidx.recyclerview.widget.RecyclerView
+import okhttp3.*
+import okhttp3.MediaType.Companion.toMediaType
+import okhttp3.RequestBody.Companion.toRequestBody
+import org.json.JSONObject
+import java.io.IOException
 import java.text.SimpleDateFormat
 import java.util.*
-import java.util.concurrent.ConcurrentHashMap
+import java.util.concurrent.CompletableFuture
 import java.util.concurrent.CopyOnWriteArrayList
 import java.util.concurrent.TimeUnit
-import java.util.regex.Pattern
 
-// ==========================================
-// 1. 频道数据定义
-// ==========================================
-data class Channel(val id: String, val code: String, val name: String)
-
-val CHANNELS = listOf(
-    Channel("431", "hbws", "湖北卫视"),
-    Channel("432", "hbjs", "湖北经视"),
-    Channel("433", "hbzh", "湖北综合"),
-    Channel("435", "hbys", "湖北影视"),
-    Channel("437", "hbjy", "湖北教育"),
-    Channel("438", "hbls", "垄上频道")
-)
-
-const val PC_UA = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
-
-// ==========================================
-// 2. 全局日志管理器
-// ==========================================
 object LogManager {
     private val sdf = SimpleDateFormat("HH:mm:ss", Locale.getDefault())
     private val logList = CopyOnWriteArrayList<String>()
@@ -59,339 +32,343 @@ object LogManager {
 
     fun log(msg: String) {
         val entry = "[${sdf.format(Date())}] $msg"
-        if (logList.size > 300) logList.removeAt(0)
+        if (logList.size > 100) logList.removeAt(0)
         logList.add(entry)
         onLogListener?.invoke(entry)
     }
 
     fun getAllLogs(): String = logList.joinToString("\n")
-    fun clear() = logList.clear()
 }
 
-// ==========================================
-// 3. 6个 WebView 常驻心跳与定时续期池 (核心防休眠增强)
-// ==========================================
-@SuppressLint("SetJavaScriptEnabled")
-object WebViewKeeper {
-    private val mainHandler = Handler(Looper.getMainLooper())
-    private val webViewMap = mutableMapOf<String, WebView>()
-    private val liveUrls = ConcurrentHashMap<String, String>()
+class MainActivity : AppCompatActivity() {
 
-    fun getUrl(cid: String): String? = liveUrls[cid]
+    private lateinit var playerWebView: WebView
+    private lateinit var tvCurrentPlaying: TextView
+    private lateinit var channelDrawer: View
+    private lateinit var rvChannels: RecyclerView
 
-    fun init(context: Context, container: ViewGroup? = null) {
-        mainHandler.post {
-            try {
-                // 开启 Cookie 支持
-                CookieManager.getInstance().setAcceptCookie(true)
+    private var currentGroup = ChannelGroup.CCTV
+    private lateinit var adapter: ChannelAdapter
+    private var currentChannelIndex = 0
 
-                for (ch in CHANNELS) {
-                    if (webViewMap.containsKey(ch.id)) continue
-                    val wv = WebView(context.applicationContext).apply {
-                        settings.javaScriptEnabled = true
-                        settings.domStorageEnabled = true
-                        settings.databaseEnabled = true
-                        settings.mediaPlaybackRequiresUserGesture = false
-                        settings.mixedContentMode = WebSettings.MIXED_CONTENT_ALWAYS_ALLOW
-                        settings.userAgentString = PC_UA // 强制使用桌面端 UA
-                        settings.cacheMode = WebSettings.LOAD_NO_CACHE
-
-                        CookieManager.getInstance().setAcceptThirdPartyCookies(this, true)
-
-                        webViewClient = object : WebViewClient() {
-                            override fun onPageFinished(view: WebView?, url: String?) {
-                                LogManager.log("[${ch.name}] 页面就绪，激发播放器...")
-                                scheduleCheck(ch.id, 1)
-                            }
-
-                            override fun onReceivedSslError(view: WebView?, handler: SslErrorHandler?, error: SslError?) {
-                                handler?.proceed() // 忽略证书异常，防止 CDN 被拦截
-                            }
-                        }
-
-                        // 唤醒内核渲染与心跳
-                        onResume()
-                        resumeTimers()
-
-                        loadUrl("https://news.hbtv.com.cn/app/tv/${ch.id}")
-                    }
-
-                    // 挂载到不可见视图容器，防止系统判定为游离进程而冻结
-                    container?.addView(wv)
-                    webViewMap[ch.id] = wv
-                }
-                schedulePeriodicReload()
-            } catch (e: Exception) {
-                LogManager.log("WebView初始化异常: ${e.message}")
-            }
-        }
-    }
-
-    private fun scheduleCheck(cid: String, attempts: Int) {
-        if (attempts > 20) {
-            val name = CHANNELS.find { it.id == cid }?.name ?: cid
-            LogManager.log("[$name] 抓取超时，重载页面中...")
-            webViewMap[cid]?.reload()
-            return
-        }
-
-        mainHandler.postDelayed({
-            val wv = webViewMap[cid] ?: return@postDelayed
-            // 执行播放器激活脚本并取值
-            val js = """
-                (function(){
-                    var v = document.querySelector('video');
-                    if (v) {
-                        v.muted = true;
-                        try { v.play(); } catch(e){}
-                        if (v.currentSrc && v.currentSrc.length > 5) return v.currentSrc;
-                        if (v.src && v.src.length > 5) return v.src;
-                    }
-                    return '';
-                })()
-            """.trimIndent()
-
-            wv.evaluateJavascript(js) { res ->
-                val cleaned = res?.trim('"', '\'', ' ') ?: ""
-                val name = CHANNELS.find { it.id == cid }?.name ?: cid
-                if (cleaned.isNotEmpty() && cleaned.startsWith("http")) {
-                    liveUrls[cid] = cleaned
-                    LogManager.log("[$name] 抓取成功: ${cleaned.take(45)}...")
-                } else {
-                    if (attempts % 4 == 0) {
-                        LogManager.log("[$name] 正在解析播放流 (尝试 $attempts/20)...")
-                    }
-                    scheduleCheck(cid, attempts + 1)
-                }
-            }
-        }, 2000)
-    }
-
-    private fun schedulePeriodicReload() {
-        mainHandler.postDelayed({
-            LogManager.log("执行 20 分钟定时换新续期...")
-            for ((_, wv) in webViewMap) {
-                wv.reload()
-            }
-            schedulePeriodicReload()
-        }, 20 * 60 * 1000L)
-    }
-
-    fun destroy() {
-        mainHandler.post {
-            for ((_, wv) in webViewMap) {
-                wv.destroy()
-            }
-            webViewMap.clear()
-            liveUrls.clear()
-        }
-    }
-}
-
-// ==========================================
-// 4. 内置轻量 HTTP 代理服务器 (补 Referer + 重写分片)
-// ==========================================
-class LocalProxyServer(port: Int) : NanoHTTPD(port) {
-
-    private val client = OkHttpClient.Builder()
-        .connectTimeout(10, TimeUnit.SECONDS)
+    private val httpClient = OkHttpClient.Builder()
+        .connectTimeout(15, TimeUnit.SECONDS)
         .readTimeout(20, TimeUnit.SECONDS)
         .build()
 
-    private val referer = "https://news.hbtv.com.cn/"
-    private val tsPattern = Pattern.compile("^https://live\\d+-cjy\\.hbtv\\.com\\.cn/")
-
-    override fun serve(session: IHTTPSession): Response {
-        val uri = session.uri
-        val params = session.parameters
-
-        return try {
-            when {
-                uri == "/live.m3u" || uri == "/" -> {
-                    val m3u = StringBuilder("#EXTM3U\n")
-                    for (ch in CHANNELS) {
-                        m3u.append("#EXTINF:-1 group-title=\"湖北电视\",${ch.name}\n")
-                        m3u.append("http://127.0.0.1:8899/${ch.id}.m3u8\n")
-                    }
-                    newFixedLengthResponse(Response.Status.OK, "application/vnd.apple.mpegurl", m3u.toString())
-                }
-
-                uri == "/ts" -> {
-                    val upstreamUrl = params["u"]?.firstOrNull() ?: return newFixedLengthResponse(Response.Status.BAD_REQUEST, "text/plain", "Missing u")
-                    if (!tsPattern.matcher(upstreamUrl).find()) {
-                        return newFixedLengthResponse(Response.Status.FORBIDDEN, "text/plain", "Bad host")
-                    }
-                    val req = Request.Builder().url(upstreamUrl)
-                        .header("Referer", referer)
-                        .header("User-Agent", PC_UA)
-                        .build()
-                    val resp = client.newCall(req).execute()
-                    val bytes = resp.body?.bytes() ?: ByteArray(0)
-                    newFixedLengthResponse(Response.Status.OK, "video/mp2t", ByteArrayInputStream(bytes), bytes.size.toLong())
-                }
-
-                uri.endsWith(".m3u8") -> {
-                    val cid = uri.removePrefix("/").removeSuffix(".m3u8")
-                    val liveUrl = WebViewKeeper.getUrl(cid)
-                    if (liveUrl.isNullOrEmpty()) {
-                        LogManager.log("[$cid] 尚未就绪，重试中...")
-                        return newFixedLengthResponse(Response.Status.SERVICE_UNAVAILABLE, "text/plain", "Stream not ready yet")
-                    }
-
-                    val req = Request.Builder().url(liveUrl)
-                        .header("Referer", referer)
-                        .header("User-Agent", PC_UA)
-                        .build()
-                    val resp = client.newCall(req).execute()
-                    val rawM3u8 = resp.body?.string() ?: ""
-
-                    val baseUrl = liveUrl.substringBeforeLast("/") + "/"
-                    val modifiedM3u8 = rawM3u8.lines().joinToString("\n") { line ->
-                        val trimmed = line.trim()
-                        if (trimmed.isNotEmpty() && !trimmed.startsWith("#")) {
-                            val absoluteTs = if (trimmed.startsWith("http")) trimmed else baseUrl + trimmed
-                            "/ts?u=" + URLEncoder.encode(absoluteTs, "UTF-8")
-                        } else {
-                            line
-                        }
-                    }
-                    newFixedLengthResponse(Response.Status.OK, "application/vnd.apple.mpegurl", modifiedM3u8)
-                }
-
-                else -> newFixedLengthResponse(Response.Status.NOT_FOUND, "text/plain", "Not Found")
-            }
-        } catch (e: Exception) {
-            LogManager.log("代理请求异常: ${e.message}")
-            newFixedLengthResponse(Response.Status.INTERNAL_ERROR, "text/plain", e.message)
-        }
-    }
-}
-
-// ==========================================
-// 5. 后台前台保活服务
-// ==========================================
-class BridgeService : Service() {
-
-    private var server: LocalProxyServer? = null
-
-    override fun onCreate() {
-        super.onCreate()
-        try {
-            startForegroundNotification()
-            server = LocalProxyServer(8899).apply { start() }
-            LogManager.log("本地中继服务已在 127.0.0.1:8899 启动")
-            WebViewKeeper.init(this)
-        } catch (e: Throwable) {
-            LogManager.log("Service启动异常: ${e.message}")
-        }
-    }
-
-    private fun startForegroundNotification() {
-        try {
-            val channelId = "hbtv_bridge_service"
-            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
-                val chan = NotificationChannel(channelId, "HBTV直播服务", NotificationManager.IMPORTANCE_LOW)
-                val manager = getSystemService(Context.NOTIFICATION_SERVICE) as NotificationManager
-                manager.createNotificationChannel(chan)
-            }
-            val notification = NotificationCompat.Builder(this, channelId)
-                .setContentTitle("长江云直播助手运行中")
-                .setContentText("127.0.0.1:8899 正在中继")
-                .setSmallIcon(android.R.drawable.stat_notify_sync)
-                .setPriority(NotificationCompat.PRIORITY_LOW)
-                .build()
-
-            startForeground(1, notification)
-        } catch (e: Throwable) {
-            LogManager.log("通知栏初始化警告: ${e.message}")
-        }
-    }
-
-    override fun onDestroy() {
-        server?.stop()
-        WebViewKeeper.destroy()
-        LogManager.log("服务已关闭")
-        super.onDestroy()
-    }
-
-    override fun onBind(intent: Intent?): IBinder? = null
-}
-
-// ==========================================
-// 6. 主界面
-// ==========================================
-class MainActivity : AppCompatActivity() {
-
-    private var isRunning = false
+    // 跨平台桥接 Future
+    private var tokenRndFuture: CompletableFuture<String>? = null
+    private var signatureFuture: CompletableFuture<String>? = null
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
+        setContentView(R.layout.activity_main)
 
-        try {
-            setContentView(R.layout.activity_main)
+        playerWebView = findViewById(R.id.playerWebView)
+        tvCurrentPlaying = findViewById(R.id.tvCurrentPlaying)
+        channelDrawer = findViewById(R.id.channelDrawer)
+        rvChannels = findViewById(R.id.rvChannels)
 
-            val btnToggle = findViewById<Button>(R.id.btnToggle)
-            val btnCopy = findViewById<Button>(R.id.btnCopy)
-            val btnClear = findViewById<Button>(R.id.btnClear)
-            val tvLogs = findViewById<TextView>(R.id.tvLogs)
-            val scrollView = findViewById<ScrollView>(R.id.scrollView)
-            val hiddenContainer = findViewById<ViewGroup>(R.id.hiddenWebContainer)
+        val btnToggleDrawer = findViewById<Button>(R.id.btnToggleDrawer)
+        val tabCctv = findViewById<Button>(R.id.tabCctv)
+        val tabSatellite = findViewById<Button>(R.id.tabSatellite)
+        val tabLocal = findViewById<Button>(R.id.tabLocal)
 
-            LogManager.onLogListener = {
-                runOnUiThread {
-                    tvLogs.text = LogManager.getAllLogs()
-                    scrollView.post { scrollView.fullScroll(ScrollView.FOCUS_DOWN) }
-                }
+        // 1. 启动后台中继服务 (监听 18888)
+        startService(Intent(this, BridgeService::class.java).apply {
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+                startForegroundService(this)
+            } else {
+                startService(this)
             }
+        })
+        val hiddenContainer = findViewById<ViewGroup>(R.id.hiddenWebContainer)
+        WebViewKeeper.init(this, hiddenContainer)
 
-            btnToggle.setOnClickListener {
-                val intent = Intent(this, BridgeService::class.java)
+        // 2. 初始化核心播放器 WebView
+        initPlayerWebView()
+
+        // 3. 配置列表与分类
+        rvChannels.layoutManager = LinearLayoutManager(this)
+        adapter = ChannelAdapter(getFilteredChannels()) { ch ->
+            playChannel(ch)
+            channelDrawer.visibility = View.GONE
+        }
+        rvChannels.adapter = adapter
+
+        btnToggleDrawer.setOnClickListener {
+            channelDrawer.visibility = if (channelDrawer.visibility == View.VISIBLE) View.GONE else View.VISIBLE
+        }
+
+        val updateTabs = {
+            tabCctv.setTextColor(if (currentGroup == ChannelGroup.CCTV) 0xFF2F6BFF.toInt() else 0xFF888888.toInt())
+            tabSatellite.setTextColor(if (currentGroup == ChannelGroup.SATELLITE) 0xFF2F6BFF.toInt() else 0xFF888888.toInt())
+            tabLocal.setTextColor(if (currentGroup == ChannelGroup.LOCAL) 0xFF2F6BFF.toInt() else 0xFF888888.toInt())
+            adapter.updateData(getFilteredChannels())
+        }
+
+        tabCctv.setOnClickListener { currentGroup = ChannelGroup.CCTV; updateTabs() }
+        tabSatellite.setOnClickListener { currentGroup = ChannelGroup.SATELLITE; updateTabs() }
+        tabLocal.setOnClickListener { currentGroup = ChannelGroup.LOCAL; updateTabs() }
+    }
+
+    @SuppressLint("SetJavaScriptEnabled")
+    private fun initPlayerWebView() {
+        playerWebView.settings.apply {
+            javaScriptEnabled = true
+            domStorageEnabled = true
+            databaseEnabled = true
+            mediaPlaybackRequiresUserGesture = false
+            mixedContentMode = WebSettings.MIXED_CONTENT_ALWAYS_ALLOW
+            userAgentString = AuthSigner.Ua
+            cacheMode = WebSettings.LOAD_NO_CACHE
+        }
+
+        // 注入 Windows WebView2 兼容接口 (window.chrome.webview.postMessage)
+        playerWebView.addJavascriptInterface(object {
+            @JavascriptInterface
+            fun postMessage(jsonStr: String) {
                 try {
-                    if (!isRunning) {
-                        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
-                            startForegroundService(intent)
-                        } else {
-                            startService(intent)
-                        }
-                        btnToggle.text = "停止服务"
-                        btnToggle.setBackgroundColor(0xFFD32F2F.toInt())
-                        isRunning = true
-                        LogManager.log("正在唤醒 6 个后台标签页并抓流...")
-                        // 挂载到当前主界面以激活硬件加速渲染
-                        WebViewKeeper.init(this, hiddenContainer)
-                    } else {
-                        stopService(intent)
-                        btnToggle.text = "启动服务"
-                        btnToggle.setBackgroundColor(0xFF2196F3.toInt())
-                        isRunning = false
-                        LogManager.log("服务已停止")
+                    val obj = JSONObject(jsonStr)
+                    if (obj.has("tokenRnd")) {
+                        tokenRndFuture?.complete(obj.getString("tokenRnd"))
                     }
-                } catch (e: Throwable) {
-                    LogManager.log("启动服务捕获错误: ${e.message}")
+                    if (obj.has("signature")) {
+                        signatureFuture?.complete(obj.getString("signature"))
+                    }
+                    if (obj.has("dblclick") || obj.has("menu")) {
+                        runOnUiThread {
+                            channelDrawer.visibility = if (channelDrawer.visibility == View.VISIBLE) View.GONE else View.VISIBLE
+                        }
+                    }
+                } catch (e: Exception) {
+                    // ignore
                 }
             }
+        }, "AndroidBridge")
 
-            // 一键复制全部日志
-            btnCopy.setOnClickListener {
-                val clipboard = getSystemService(Context.CLIPBOARD_SERVICE) as ClipboardManager
-                val clip = ClipData.newPlainText("Logs", LogManager.getAllLogs())
-                clipboard.setPrimaryClip(clip)
-                Toast.makeText(this, "日志已复制到剪贴板", Toast.LENGTH_SHORT).show()
+        playerWebView.webViewClient = object : WebViewClient() {
+            override fun onPageFinished(view: WebView?, url: String?) {
+                // 注入兼容 polyfill，让 player.served.html 能像在 Windows 下一样发送 postMessage
+                val polyfill = """
+                    if (!window.chrome) window.chrome = {};
+                    if (!window.chrome.webview) {
+                        window.chrome.webview = {
+                            postMessage: function(msg) {
+                                var s = (typeof msg === 'string') ? msg : JSON.stringify(msg);
+                                AndroidBridge.postMessage(s);
+                            }
+                        };
+                    }
+                """.trimIndent()
+                playerWebView.evaluateJavascript(polyfill, null)
+
+                // 首次加载完毕自动播放第一个台
+                playChannel(ChannelRepository.channels.first())
             }
+        }
 
-            btnClear.setOnClickListener {
-                LogManager.clear()
-                tvLogs.text = ""
+        // 加载本地托管的播放页
+        playerWebView.loadUrl("http://127.0.0.1:18888/player")
+    }
+
+    private fun getFilteredChannels(): List<TvChannel> {
+        return ChannelRepository.channels.filter { it.group == currentGroup }
+    }
+
+    // 播放频道调度
+    private fun playChannel(ch: TvChannel) {
+        tvCurrentPlaying.text = "${ch.name} (加载中...)"
+
+        if (ch.group == ChannelGroup.LOCAL) {
+            // 湖北台流直接播放改写后的本地 m3u8
+            val localM3u8 = "http://127.0.0.1:18888/hbtv/${ch.id}.m3u8"
+            startHlsPlay(localM3u8)
+            tvCurrentPlaying.text = "${ch.name} (播放中)"
+            return
+        }
+
+        // 央视/卫视官方取流全流程 (异步调度)
+        Thread {
+            try {
+                val m3u8 = fetchCctvM3u8(ch)
+                runOnUiThread {
+                    if (m3u8 != null) {
+                        startHlsPlay(m3u8)
+                        tvCurrentPlaying.text = "${ch.name} (CMG 解密播放中)"
+                    } else {
+                        tvCurrentPlaying.text = "${ch.name} (获取播放流失败)"
+                    }
+                }
+            } catch (e: Exception) {
+                runOnUiThread {
+                    tvCurrentPlaying.text = "${ch.name} 错误: ${e.message}"
+                }
             }
+        }.start()
+    }
 
-            LogManager.log("软件就绪，点击【启动服务】开始。")
+    // 官方鉴权全流程：auth -> openToken -> cKey -> yspticket -> get_live_info
+    private fun fetchCctvM3u8(ch: TvChannel): String? {
+        val randStr = AuthSigner.randStr(10)
+        val authSig = AuthSigner.computeAuthSignature(ch.pid, AuthSigner.Guid, randStr)
+        val seqId = (System.currentTimeMillis() % 100000000).toString()
+        val ts = System.currentTimeMillis().toString()
+        val reqId = "999999" + AuthSigner.randStr(10) + ts
 
-        } catch (e: Throwable) {
-            AlertDialog.Builder(this)
-                .setTitle("界面报错")
-                .setMessage(e.stackTraceToString())
-                .setPositiveButton("确定", null)
-                .show()
+        // 1. POST /auth
+        val authBody = "pid=${ch.pid}&guid=${AuthSigner.Guid}&appid=ysp_pc&rand_str=$randStr&signature=$authSig"
+        val authReq = Request.Builder().url("http://127.0.0.1:18888/auth")
+            .post(authBody.toRequestBody("application/x-www-form-urlencoded".toMediaType()))
+            .build()
+        val authRes = httpClient.newCall(authReq).execute().body?.string() ?: return null
+        val authJson = JSONObject(authRes)
+        val token = authJson.optJSONObject("data")?.optString("token") ?: return null
+        val authTs = authJson.optJSONObject("data")?.optString("ts") ?: (System.currentTimeMillis() / 1000).toString()
+
+        // 2. JS 生成 tokenRnd -> GET /open-token
+        tokenRndFuture = CompletableFuture()
+        runOnUiThread {
+            playerWebView.evaluateJavascript("window.__genTokenRnd('${AuthSigner.Guid}', '$token', '$ts')", null)
+        }
+        val rndVal = tokenRndFuture?.get(8, TimeUnit.SECONDS) ?: return null
+
+        val openUrl = "http://127.0.0.1:18888/open-token?yspappid=${AuthSigner.YspAppId}&guid=${AuthSigner.Guid}&vappid=${AuthSigner.VappId}&vsecret=${AuthSigner.Vsecret}&raw=1&version=v1&ts=$ts&rnd=$rndVal"
+        val openRes = httpClient.newCall(Request.Builder().url(openUrl).build()).execute().body?.string() ?: return null
+        val sessionToken = JSONObject(openRes).optJSONObject("data")?.optString("token") ?: return null
+
+        // 3. 动态生成 cKey (调用页面内 fb15 webpack)
+        val cKeyFuture = CompletableFuture<String>()
+        val safeUrl = "https://yangshipin.cn/tv/home?pid=${ch.pid}"
+        val tsSec = (System.currentTimeMillis() / 1000).toString()
+        runOnUiThread {
+            playerWebView.evaluateJavascript("window.__genCKey('${ch.cnlId}', '$tsSec', 'V1.0.0', '${AuthSigner.Guid}', '5910204', '$safeUrl')") { res ->
+                val v = res?.trim('"', '\'', ' ') ?: ""
+                cKeyFuture.complete(v)
+            }
+        }
+        val cKey = cKeyFuture.get(5, TimeUnit.SECONDS)
+
+        // 4. 动态生成 yspticket (调用页面内 RJq7sO71JF.wasm)
+        val ticketFuture = CompletableFuture<String>()
+        runOnUiThread {
+            playerWebView.evaluateJavascript("window.__genYspTicket('${ch.pid}', '$authTs', '${ch.cnlId}', '${AuthSigner.Guid}', '${AuthSigner.YspAppId}', 'V1.0.0')") { res ->
+                val v = res?.trim('"', '\'', ' ') ?: ""
+                ticketFuture.complete(v)
+            }
+        }
+        val yspticket = ticketFuture.get(5, TimeUnit.SECONDS)
+
+        // 5. 计算 sdkInput 与 bodySig
+        val randStrLive = AuthSigner.randStr(10)
+        val liveFields = mutableMapOf(
+            "cnlid" to ch.cnlId, "livepid" to ch.pid, "stream" to "2", "guid" to AuthSigner.Guid,
+            "cKey" to cKey, "adjust" to "1", "sphttps" to "1", "platform" to "5910204", "cmd" to "2",
+            "encryptVer" to "8.1", "dtype" to "1", "devid" to "devid", "otype" to "ojson",
+            "appVer" to "V1.0.0", "app_version" to "V1.0.0", "channel" to "ysp_tx", "defn" to "fhd",
+            "rand_str" to randStrLive
+        )
+        val yspsdkinput = AuthSigner.computeLiveSdkInput(liveFields)
+        val bodySig = AuthSigner.computeLiveBodySignature(liveFields)
+
+        // 6. 生成 sig2 (openapi_signature)
+        signatureFuture = CompletableFuture()
+        runOnUiThread {
+            playerWebView.evaluateJavascript("window.__generateSignature('${ch.pid}','${AuthSigner.Guid}','$seqId','$reqId','$sessionToken','$ts','$yspsdkinput')", null)
+        }
+        val sig2 = signatureFuture?.get(8, TimeUnit.SECONDS) ?: return null
+
+        // 7. POST /get-live-info
+        val bodyJson = JSONObject(liveFields as Map<*, *>).apply {
+            put("signature", bodySig)
+            put("adjust", 1)
+        }.toString()
+
+        val liveReq = Request.Builder().url("http://127.0.0.1:18888/get-live-info")
+            .post(bodyJson.toRequestBody("application/json; charset=utf-8".toMediaType()))
+            .header("yspappid", AuthSigner.YspAppId)
+            .header("yspplayertoken", token)
+            .header("yspsdkinput", yspsdkinput)
+            .header("yspsdksign", "$sig2-$yspsdkinput-${AuthSigner.Guid}-$seqId-$reqId")
+            .header("yspticket", yspticket)
+            .header("request-id", reqId)
+            .header("seqid", seqId)
+            .header("Cookie", AuthSigner.Cookie)
+            .build()
+
+        val liveRes = httpClient.newCall(liveReq).execute().body?.string() ?: return null
+        val data = JSONObject(liveRes).optJSONObject("data") ?: return null
+        val playUrl = data.optString("playurl")
+        val ext = data.optString("extended_param", "")
+        return if (playUrl.isNotEmpty()) playUrl + ext else null
+    }
+
+    private fun startHlsPlay(m3u8Url: String) {
+        val safe = m3u8Url.replace("'", "\\'")
+        playerWebView.evaluateJavascript("window.__startM3u8('$safe');", null)
+    }
+
+    // 电视盒子遥控器上下换台与确定键选台支持
+    override fun onKeyDown(keyCode: Int, event: KeyEvent?): Boolean {
+        val currentList = getFilteredChannels()
+        if (currentList.isEmpty()) return super.onKeyDown(keyCode, event)
+
+        when (keyCode) {
+            KeyEvent.KEYCODE_DPAD_UP -> {
+                currentChannelIndex = (currentChannelIndex - 1 + currentList.size) % currentList.size
+                playChannel(currentList[currentChannelIndex])
+                return true
+            }
+            KeyEvent.KEYCODE_DPAD_DOWN -> {
+                currentChannelIndex = (currentChannelIndex + 1) % currentList.size
+                playChannel(currentList[currentChannelIndex])
+                return true
+            }
+            KeyEvent.KEYCODE_DPAD_CENTER, KeyEvent.KEYCODE_ENTER -> {
+                channelDrawer.visibility = if (channelDrawer.visibility == View.VISIBLE) View.GONE else View.VISIBLE
+                return true
+            }
+            KeyEvent.KEYCODE_BACK -> {
+                if (channelDrawer.visibility == View.VISIBLE) {
+                    channelDrawer.visibility = View.GONE
+                    return true
+                }
+            }
+        }
+        return super.onKeyDown(keyCode, event)
+    }
+
+    // 频道列表适配器
+    class ChannelAdapter(
+        private var list: List<TvChannel>,
+        private val onClick: (TvChannel) -> Unit
+    ) : RecyclerView.Adapter<ChannelAdapter.ViewHolder>() {
+
+        class ViewHolder(v: View) : RecyclerView.ViewHolder(v) {
+            val tvName: TextView = v.findViewById(R.id.tvChannelName)
+        }
+
+        override fun onCreateViewHolder(parent: ViewGroup, viewType: Int): ViewHolder {
+            val v = LayoutInflater.from(parent.context).inflate(R.layout.item_channel, parent, false)
+            return ViewHolder(v)
+        }
+
+        override fun onBindViewHolder(holder: ViewHolder, position: Int) {
+            val ch = list[position]
+            holder.tvName.text = ch.name
+            holder.itemView.setOnClickListener { onClick(ch) }
+
+            // TV 遥控器焦点高亮
+            holder.itemView.setOnFocusChangeListener { view, hasFocus ->
+                view.setBackgroundColor(if (hasFocus) 0xFF2F6BFF.toInt() else 0xFF21213E.toInt())
+            }
+        }
+
+        override fun getItemCount(): Int = list.size
+
+        fun updateData(newList: List<TvChannel>) {
+            list = newList
+            notifyDataSetChanged()
         }
     }
 }
