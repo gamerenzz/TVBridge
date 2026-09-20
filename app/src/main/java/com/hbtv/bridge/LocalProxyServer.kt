@@ -42,11 +42,20 @@ class LocalProxyServer(private val context: Context, port: Int = 18888) : NanoHT
                     serveAsset(assetPath, mime)
                 }
 
-                // 3. /auth 鉴权代理
+                // 3. /auth 鉴权代理 (防止 form-urlencoded 丢失 body)
                 uri == "/auth" && method == Method.POST -> {
-                    val map = HashMap<String, String>()
-                    session.parseBody(map)
-                    val postData = map["postData"] ?: ""
+                    var postData = ""
+                    try {
+                        val map = HashMap<String, String>()
+                        session.parseBody(map)
+                        postData = map["postData"] ?: ""
+                    } catch (e: Exception) {}
+
+                    if (postData.isEmpty() && session.parameters.isNotEmpty()) {
+                        postData = session.parameters.map { (k, v) ->
+                            "${URLEncoder.encode(k, "UTF-8")}=${URLEncoder.encode(v.firstOrNull() ?: "", "UTF-8")}"
+                        }.joinToString("&")
+                    }
                     proxyPost("https://player-api.yangshipin.cn/v1/player/auth", postData, "application/x-www-form-urlencoded")
                 }
 
@@ -58,9 +67,13 @@ class LocalProxyServer(private val context: Context, port: Int = 18888) : NanoHT
 
                 // 5. /get-live-info 代理
                 uri == "/get-live-info" && method == Method.POST -> {
-                    val map = HashMap<String, String>()
-                    session.parseBody(map)
-                    val postData = map["postData"] ?: ""
+                    var postData = ""
+                    try {
+                        val map = HashMap<String, String>()
+                        session.parseBody(map)
+                        postData = map["postData"] ?: ""
+                    } catch (e: Exception) {}
+
                     proxyPostWithHeaders("https://player-api.yangshipin.cn/v1/player/get_live_info", postData, session.headers)
                 }
 
