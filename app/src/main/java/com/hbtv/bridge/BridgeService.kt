@@ -11,17 +11,15 @@ import androidx.core.app.NotificationCompat
 
 class BridgeService : Service() {
 
-    private var server: LocalProxyServer? = null
-
     override fun onCreate() {
         super.onCreate()
         try {
             startForegroundNotification()
-            server = LocalProxyServer(this, 18888).apply { start() }
-            LogManager.log("本地中继服务器在 127.0.0.1:18888 启动")
+            // 使用单例启动，避免重复 bind 端口报 EADDRINUSE
+            ServerManager.start(this)
             WebViewKeeper.init(this)
         } catch (e: Throwable) {
-            LogManager.log("Service 启动异常: ${e.message}")
+            LogManager.log("Service 启动警告: ${e.message}")
         }
     }
 
@@ -47,7 +45,7 @@ class BridgeService : Service() {
     }
 
     override fun onDestroy() {
-        server?.stop()
+        ServerManager.stop()
         WebViewKeeper.destroy()
         LogManager.log("本地服务已关闭")
         super.onDestroy()
