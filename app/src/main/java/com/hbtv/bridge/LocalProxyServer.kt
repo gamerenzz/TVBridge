@@ -48,9 +48,9 @@ class LocalProxyServer(private val context: Context, port: Int = 18888) : NanoHT
                     handleMediaProxy(session)
                 }
 
-                // ★★★ 核心攻关：对 hls.cmg.js 注入 earlyWrap 与 cmgDecNew 原地补解密 ★★★
+                // ★ 完整注入 main.go 的 P/B 帧原地解密与内存热修补 ★
                 uri.startsWith("/sapi") -> {
-                    handleSapiSmartWithPatches(uri)
+                    handleSapiWithFullMainGoPatches(uri)
                 }
 
                 uri == "/auth" && method == Method.POST -> {
@@ -183,8 +183,8 @@ class LocalProxyServer(private val context: Context, port: Int = 18888) : NanoHT
         return sb.toString()
     }
 
-    // ★★★ 核心还原：把 main.go 里针对 hls.cmg.js 的 VMPATCH3 内存热修补与 FIX-PB 原地补解密完整注入 ★★★
-    private fun handleSapiSmartWithPatches(uri: String): Response {
+    // ★★★ 核心：完整还原 main.go 中对 hls.cmg.js 的全部原地补解密代码 ★★★
+    private fun handleSapiWithFullMainGoPatches(uri: String): Response {
         val pathOnly = if (uri.contains('?')) uri.substringBefore('?') else uri
         val rawSub = pathOnly.removePrefix("/sapi").trim('/')
         val cacheKey = rawSub.replace('/', '_')
@@ -202,17 +202,15 @@ class LocalProxyServer(private val context: Context, port: Int = 18888) : NanoHT
                     var text = context.assets.open(assetPath).bufferedReader().use { it.readText() }
                     text = text.replace("https://sapi.yangshipin.cn", "/sapi")
 
-                    // 1. 注入 IndexedDB 绕过补丁
+                    // 1. IndexedDB 门控补丁
                     if (text.contains("EM_IDB_STORE")) {
                         val fetchGateOld = "if((!c||\"EM_IDB_STORE\"===r||\"EM_IDB_DELETE\"===r)&&!Fetch.dbInstance)return C(A),0;"
                         val fetchGateNew = "var __cmgRW=function(p){try{var u=UTF8ToString(p);if(/yangshipin\\.cn|cctv\\.cn/.test(u)&&u.indexOf('127.0.0.1')<0){var nu='http://127.0.0.1:18888/media?u='+encodeURIComponent(u);var b=[];for(var i=0;i<nu.length;i++)b.push(nu.charCodeAt(i));b.push(0);var np=_malloc(b.length);if(np){for(var j=0;j<b.length;j++)HEAPU8[np+j]=b[j];HEAPU32[p>>2]=np;return nu;}}}catch(e){}return null;};if(\"EM_IDB_STORE\"!==r&&\"EM_IDB_DELETE\"!==r){try{__cmgRW(HEAPU32[A+8>>2]);}catch(_e){}__emscripten_fetch_xhr(A,o,C,E,Q);return A;}if((!c||\"EM_IDB_STORE\"===r||\"EM_IDB_DELETE\"===r)&&!Fetch.dbInstance)return C(A),0;"
                         text = text.replace(fetchGateOld, fetchGateNew)
                     }
 
-                    // 2. ★ 注入 main.go 的 earlyWrap (VMPATCH3 内存热修补) 与 cmgDecNew (P/B帧原地解密) ★
+                    // 2. ★ 完整无损注入 main.go 的 earlyWrap 与 cmgDecNew (含 NALU 1 / 5 原地覆写逻辑) ★
                     if (assetPath.contains("hls.cmg.js")) {
-                        LogManager.log("[SAPI] 正在为 hls.cmg.js 注入 VMPATCH3 与 P/B 帧原地解密补丁...")
-                        
                         val earlyWrap = """
                             (function(){
                               if(window.__cmgEarlyInstalled) return;
@@ -251,17 +249,112 @@ class LocalProxyServer(private val context: Context, port: Int = 18888) : NanoHT
                               },2000);
                             })();
                         """.trimIndent()
-                        
+
                         text = earlyWrap + "\n" + text
 
                         val cmgDecOld = "fG[wz(0x6bf)](jJ[wz(0x97f)],jJ['config'][wz(0x291)],jN[wz(0x944)],fG[wz(0x9d2)])"
                         val cmgDecOld2 = "fG[wz(0x6bf)](jJ[wz(0x97f)],jJ[wz(0xb0b)][wz(0x291)],jN[wz(0x944)],fG[wz(0x22f)])"
-                        
-                        val cmgDecNew = "(function(__in){var __m=jJ[wz(0x97f)],__ts=jJ['config'][wz(0x291)],__k=fG[wz(0x9d2)],__mt=(jJ[wz(0xb0b)]&&jJ[wz(0xb0b)]['mediaTagId'])!=null?jJ[wz(0xb0b)]['mediaTagId']:'NULL';var __out=fG[wz(0x6bf)](__m,__ts,__in,__k);try{if(jN['type']===0x5){try{var __wd=(jN[0x944]&&jN[0x944].slice)?jN[0x944].slice(0x0):new Uint8Array([0x65,0x01,0x00,0x00,0x00,0x00,0x00,0x00]);__wd[0x0]=0x41;fG[wz(0x6bf)](__m,__ts,__wd,__k);}catch(e){}}}catch(e){}return __out;})(jN[wz(0x944)])"
-                        val cmgDecNew2 = "(function(__in){var __m=jJ[wz(0x97f)],__lvl=jJ[wz(0xb0b)]||{},__ts=__lvl[wz(0x291)],__k=fG[wz(0x22f)],__mt=(jJ[wz(0xb0b)]&&jJ[wz(0xb0b)]['mediaTagId'])!=null?jJ[wz(0xb0b)]['mediaTagId']:'NULL';var __out=fG[wz(0x6bf)](__m,__ts,__in,__k);try{if(jN['type']===0x5){try{var __wd=(jN[0x944]&&jN[0x944].slice)?jN[0x944].slice(0x0):new Uint8Array([0x65,0x01,0x00,0x00,0x00,0x00,0x00,0x00]);__wd[0x0]=0x41;fG[wz(0x6bf)](__m,__ts,__wd,__k);}catch(e){}}}catch(e){}return __out;})(jN[wz(0x944)])"
+
+                        // ★ 完整注入 main.go 的真实原地覆写逻辑，确保 P/B/IDR 帧全部解密写回内存！
+                        val cmgDecNew = """
+                            (function(__in){
+                              var __m=jJ[wz(0x97f)],__ts=jJ['config'][wz(0x291)],__k=fG[wz(0x9d2)],__mt=(jJ[wz(0xb0b)]&&jJ[wz(0xb0b)]['mediaTagId'])!=null?jJ[wz(0xb0b)]['mediaTagId']:'NULL';
+                              var __out=fG[wz(0x6bf)](__m,__ts,__in,__k);
+                              try{
+                                if(jN['type']===0x1){
+                                  var __id=true;
+                                  if(__out&&__in&&__out.length===__in.length){
+                                    for(var __z=0;__z<0x100&&__z<__out.length;__z++){if(__out[__z]!==__in[__z]){__id=false;break;}}
+                                  } else {__id=false;}
+                                  if(__id){
+                                    (window.__cmgPB=window.__cmgPB||{})[__mt]={jN:jN,__in:__in,__m:__m,__ts:__ts,__k:__k};
+                                  } else {
+                                    var __bf=(window.__cmgPB=window.__cmgPB||{})[__mt];
+                                    if(__bf&&__bf.jN){
+                                      try{
+                                        var __fx=fG[wz(0x6bf)](__bf.__m,__bf.__ts,__bf.__in,__bf.__k);
+                                        if(__fx&&__fx.length===__bf.__in.length){
+                                          if(__bf.jN[0x944]&&typeof __bf.jN[0x944].set==='function'){__bf.jN[0x944].set(__fx);}
+                                          if(__bf.jN['data']&&typeof __bf.jN['data'].set==='function'){__bf.jN['data'].set(__fx);}
+                                        }
+                                        delete (window.__cmgPB)[__mt];
+                                      }catch(e){}
+                                    }
+                                  }
+                                } else if(jN['type']===0x5){
+                                  try{
+                                    var __wd=(jN[0x944]&&jN[0x944].slice)?jN[0x944].slice(0x0):new Uint8Array([0x65,0x01,0x00,0x00,0x00,0x00,0x00,0x00]);
+                                    __wd[0x0]=0x41;
+                                    fG[wz(0x6bf)](__m,__ts,__wd,__k);
+                                  }catch(e){}
+                                  var __bf2=(window.__cmgPB=window.__cmgPB||{})[__mt];
+                                  if(__bf2&&__bf2.jN){
+                                    try{
+                                      var __fx2=fG[wz(0x6bf)](__bf2.__m,__bf2.__ts,__bf2.__in,__bf2.__k);
+                                      if(__fx2&&__fx2.length===__bf2.__in.length){
+                                        if(__bf2.jN[0x944]&&typeof __bf2.jN[0x944].set==='function'){__bf2.jN[0x944].set(__fx2);}
+                                        if(__bf2.jN['data']&&typeof __bf2.jN['data'].set==='function'){__bf2.jN['data'].set(__fx2);}
+                                      }
+                                      delete (window.__cmgPB)[__mt];
+                                    }catch(e){}
+                                  }
+                                }
+                              }catch(e){}
+                              return __out;
+                            })(jN[wz(0x944)])
+                        """.trimIndent()
+
+                        val cmgDecNew2 = """
+                            (function(__in){
+                              var __m=jJ[wz(0x97f)],__lvl=jJ[wz(0xb0b)]||{},__ts=__lvl[wz(0x291)],__k=fG[wz(0x22f)],__mt=(jJ[wz(0xb0b)]&&jJ[wz(0xb0b)]['mediaTagId'])!=null?jJ[wz(0xb0b)]['mediaTagId']:'NULL';
+                              var __out=fG[wz(0x6bf)](__m,__ts,__in,__k);
+                              try{
+                                if(jN['type']===0x1){
+                                  var __id=true;
+                                  if(__out&&__in&&__out.length===__in.length){
+                                    for(var __z=0;__z<0x100&&__z<__out.length;__z++){if(__out[__z]!==__in[__z]){__id=false;break;}}
+                                  } else {__id=false;}
+                                  if(__id){
+                                    (window.__cmgPB=window.__cmgPB||{})[__mt]={jN:jN,__in:__in,__m:__m,__ts:__ts,__k:__k};
+                                  } else {
+                                    var __bf=(window.__cmgPB=window.__cmgPB||{})[__mt];
+                                    if(__bf&&__bf.jN){
+                                      try{
+                                        var __fx=fG[wz(0x6bf)](__bf.__m,__bf.__ts,__bf.__in,__bf.__k);
+                                        if(__fx&&__fx.length===__bf.__in.length){
+                                          if(__bf.jN[0x944]&&typeof __bf.jN[0x944].set==='function'){__bf.jN[0x944].set(__fx);}
+                                          if(__bf.jN['data']&&typeof __bf.jN['data'].set==='function'){__bf.jN['data'].set(__fx);}
+                                        }
+                                        delete (window.__cmgPB)[__mt];
+                                      }catch(e){}
+                                    }
+                                  }
+                                } else if(jN['type']===0x5){
+                                  try{
+                                    var __wd=(jN[0x944]&&jN[0x944].slice)?jN[0x944].slice(0x0):new Uint8Array([0x65,0x01,0x00,0x00,0x00,0x00,0x00,0x00]);
+                                    __wd[0x0]=0x41;
+                                    fG[wz(0x6bf)](__m,__ts,__wd,__k);
+                                  }catch(e){}
+                                  var __bf2=(window.__cmgPB=window.__cmgPB||{})[__mt];
+                                  if(__bf2&&__bf2.jN){
+                                    try{
+                                      var __fx2=fG[wz(0x6bf)](__bf2.__m,__bf2.__ts,__bf2.__in,__bf2.__k);
+                                      if(__fx2&&__fx2.length===__bf2.__in.length){
+                                        if(__bf2.jN[0x944]&&typeof __bf2.jN[0x944].set==='function'){__bf2.jN[0x944].set(__fx2);}
+                                        if(__bf2.jN['data']&&typeof __bf2.jN['data'].set==='function'){__bf2.jN['data'].set(__fx2);}
+                                      }
+                                      delete (window.__cmgPB)[__mt];
+                                    }catch(e){}
+                                  }
+                                }
+                              }catch(e){}
+                              return __out;
+                            })(jN[wz(0x944)])
+                        """.trimIndent()
 
                         text = text.replace(cmgDecOld, cmgDecNew)
                         text = text.replace(cmgDecOld2, cmgDecNew2)
+                        LogManager.log("[SAPI] hls.cmg.js 全量补解密补丁已注入完成")
                     }
 
                     val mime = if (assetPath.endsWith(".js")) "application/javascript; charset=utf-8" else "application/octet-stream"
@@ -270,7 +363,7 @@ class LocalProxyServer(private val context: Context, port: Int = 18888) : NanoHT
                     return res
                 }
             } catch (e: Exception) {
-                // 尝试下一个候选路径
+                // ignore
             }
         }
 
