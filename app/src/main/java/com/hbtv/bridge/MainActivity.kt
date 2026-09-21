@@ -114,27 +114,21 @@ class MainActivity : AppCompatActivity() {
         val tabSatellite = findViewById<Button>(R.id.tabSatellite)
         val tabLocal = findViewById<Button>(R.id.tabLocal)
 
-        // 确保 TextView 可自由选词、全选
         tvConsoleLogs.setTextIsSelectable(true)
 
-        // 1. 【一键复制全部日志】
         btnCopyAllLogs.setOnClickListener {
             val allLogs = LogManager.getAllLogs()
             if (allLogs.isNotEmpty()) {
                 val clipboard = getSystemService(Context.CLIPBOARD_SERVICE) as ClipboardManager
                 val clip = ClipData.newPlainText("PalmTV_Logs", allLogs)
                 clipboard.setPrimaryClip(clip)
-                Toast.makeText(this, "全部日志已复制到剪贴板", Toast.LENGTH_SHORT).show()
-            } else {
-                Toast.makeText(this, "暂无日志", Toast.LENGTH_SHORT).show()
+                Toast.makeText(this, "全部日志已复制", Toast.LENGTH_SHORT).show()
             }
         }
 
-        // 2. 【清空日志】
         btnClearLogs.setOnClickListener {
             LogManager.clear()
             tvConsoleLogs.text = ""
-            Toast.makeText(this, "日志已清空", Toast.LENGTH_SHORT).show()
         }
 
         LogManager.onLogListener = {
@@ -257,7 +251,7 @@ class MainActivity : AppCompatActivity() {
         playerWebView.webViewClient = object : WebViewClient() {
             override fun onPageFinished(view: WebView?, url: String?) {
                 if (url != null && url.contains("18888/player")) {
-                    LogManager.log("player.served.html 加载成功")
+                    LogManager.log("player.served.html 加载就绪")
                     val polyfill = """
                         if (!window.chrome) window.chrome = {};
                         if (!window.chrome.webview) {
@@ -458,26 +452,43 @@ class MainActivity : AppCompatActivity() {
         return if (playUrl.isNotEmpty()) playUrl + ext else null
     }
 
+    // ★ 关键重构：将播放执行全流程日志打出，确保调用必达
     private fun startHlsPlay(m3u8Url: String) {
-        val safe = m3u8Url.replace("'", "\\'")
+        val safe = m3u8Url.replace("\\", "\\\\").replace("'", "\\'")
         val js = """
-            window.__startM3u8('$safe');
-            setTimeout(function() {
-                var v = document.querySelector('video') || document.getElementById('v');
-                if (v) {
-                    v.muted = false;
-                    v.style.position = 'fixed';
-                    v.style.top = '0';
-                    v.style.left = '0';
-                    v.style.width = '100vw';
-                    v.style.height = '100vh';
-                    v.style.objectFit = 'contain';
-                    v.style.zIndex = '1';
-                    v.play().catch(function(e){});
+            (function() {
+                try {
+                    console.log("[Player] 开始装载播放地址: " + '$safe');
+                    if (typeof window.__startM3u8 === 'function') {
+                        window.__startM3u8('$safe');
+                        console.log("[Player] __startM3u8 触发完成");
+                    } else {
+                        console.error("[Player] 错误: window.__startM3u8 尚未就绪");
+                    }
+                    setTimeout(function() {
+                        var v = document.querySelector('video') || document.getElementById('v');
+                        if (v) {
+                            v.muted = false;
+                            v.style.position = 'fixed';
+                            v.style.top = '0';
+                            v.style.left = '0';
+                            v.style.width = '100vw';
+                            v.style.height = '100vh';
+                            v.style.objectFit = 'contain';
+                            v.style.zIndex = '1';
+                            v.play().catch(function(e) {
+                                console.warn("[Player] video.play 异常: " + e.message);
+                            });
+                        }
+                    }, 500);
+                } catch(e) {
+                    console.error("[Player] 注入异常: " + e.message);
                 }
-            }, 500);
+            })();
         """.trimIndent()
-        playerWebView.evaluateJavascript(js, null)
+        playerWebView.evaluateJavascript(js) { res ->
+            // ignore
+        }
     }
 
     override fun onKeyDown(keyCode: Int, event: KeyEvent?): Boolean {
