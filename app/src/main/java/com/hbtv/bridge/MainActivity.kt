@@ -7,6 +7,7 @@ import android.content.Context
 import android.content.Intent
 import android.content.pm.ActivityInfo
 import android.graphics.Bitmap
+import android.media.AudioManager
 import android.os.Build
 import android.os.Bundle
 import android.view.KeyEvent
@@ -92,6 +93,12 @@ class MainActivity : AppCompatActivity() {
         super.onCreate(savedInstanceState)
         requestedOrientation = ActivityInfo.SCREEN_ORIENTATION_SENSOR_LANDSCAPE
         hideSystemUI()
+
+        // 强行申请系统音频焦点，确保 WebView 声音不被静音拦截
+        try {
+            val audioManager = getSystemService(Context.AUDIO_SERVICE) as AudioManager
+            audioManager.requestAudioFocus(null, AudioManager.STREAM_MUSIC, AudioManager.AUDIOFOCUS_GAIN)
+        } catch (e: Exception) {}
 
         setContentView(R.layout.activity_main)
 
@@ -456,7 +463,7 @@ class MainActivity : AppCompatActivity() {
         return if (playUrl.isNotEmpty()) playUrl + ext else null
     }
 
-    // ★★★ 核心修复：纯净触发 __startM3u8，完全交给 HLS 内部驱动播放，彻底解决 AbortError 竞态卡死 ★★★
+    // ★ 强行拉满 100% 音量与解除静音，确保声画全开
     private fun startHlsPlay(m3u8Url: String) {
         val localPlayUrl = if (m3u8Url.startsWith("http://127.0.0.1")) {
             m3u8Url
@@ -472,15 +479,15 @@ class MainActivity : AppCompatActivity() {
                     var video = document.getElementById('v') || document.querySelector('video');
                     if (video) {
                         video.muted = false;
+                        video.volume = 1.0;
+                        video.removeAttribute('muted');
                         video.style.width = '100vw';
                         video.style.height = '100vh';
                         video.style.objectFit = 'contain';
                     }
                     if (typeof window.__startM3u8 === 'function') {
                         window.__startM3u8('$safe');
-                        console.log("[Player] __startM3u8 触发成功");
-                    } else {
-                        console.error("[Player] 错误: window.__startM3u8 尚未就绪");
+                        console.log("[Player] __startM3u8 触发完成");
                     }
                 } catch(e) {
                     console.error("[Player] startHlsPlay 抛出异常: " + e.message);
