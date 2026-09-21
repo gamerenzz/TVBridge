@@ -456,6 +456,7 @@ class MainActivity : AppCompatActivity() {
         return if (playUrl.isNotEmpty()) playUrl + ext else null
     }
 
+    // ★★★ 核心修复：纯净触发 __startM3u8，完全交给 HLS 内部驱动播放，彻底解决 AbortError 竞态卡死 ★★★
     private fun startHlsPlay(m3u8Url: String) {
         val localPlayUrl = if (m3u8Url.startsWith("http://127.0.0.1")) {
             m3u8Url
@@ -468,32 +469,19 @@ class MainActivity : AppCompatActivity() {
             (function() {
                 try {
                     console.log("[Player] 开始装载: " + '$safe');
+                    var video = document.getElementById('v') || document.querySelector('video');
+                    if (video) {
+                        video.muted = false;
+                        video.style.width = '100vw';
+                        video.style.height = '100vh';
+                        video.style.objectFit = 'contain';
+                    }
                     if (typeof window.__startM3u8 === 'function') {
                         window.__startM3u8('$safe');
                         console.log("[Player] __startM3u8 触发成功");
                     } else {
-                        console.error("[Player] 错误: window.__startM3u8 尚未就绪，Hls状态=" + (typeof window.Hls));
+                        console.error("[Player] 错误: window.__startM3u8 尚未就绪");
                     }
-                    setTimeout(function() {
-                        var video = document.getElementById('v') || document.querySelector('video');
-                        if (video) {
-                            video.muted = false;
-                            video.style.display = 'block';
-                            video.style.width = '100vw';
-                            video.style.height = '100vh';
-                            video.style.objectFit = 'contain';
-                            video.play().then(function() {
-                                console.log("[Player] 视频播放起播成功 (video.play OK)");
-                            }).catch(function(e) {
-                                console.warn("[Player] 自动起播拦截: " + e.message);
-                                video.muted = true;
-                                video.play().then(function() {
-                                    video.muted = false;
-                                    console.log("[Player] 已通过兼容模式激活画面与声音");
-                                });
-                            });
-                        }
-                    }, 600);
                 } catch(e) {
                     console.error("[Player] startHlsPlay 抛出异常: " + e.message);
                 }
