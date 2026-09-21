@@ -28,7 +28,6 @@ class LocalProxyServer(private val context: Context, port: Int = 18888) : NanoHT
         val method = session.method
         val params = session.parameters
 
-        // 处理 OPTIONS 跨域预检
         if (method == Method.OPTIONS) {
             val res = newFixedLengthResponse(Response.Status.NO_CONTENT, "text/plain", "")
             addCorsHeaders(res)
@@ -42,22 +41,22 @@ class LocalProxyServer(private val context: Context, port: Int = 18888) : NanoHT
                     servePlayerHtml()
                 }
 
-                // 2. ★★★ 解决有声无画核心：返回 CMGPlayer.json 解密配置开关 ★★★
+                // 2. CMGPlayer.json 解密配置
                 uri == "/Library/CMGPlayer.json" -> {
                     serveAssetOrMockJson("CMGPlayer.json", "{\"code\":0,\"data\":{\"switch\":1}}")
                 }
 
-                // 3. ★★★ 解决有声无画核心：完全复刻 main.go 的 /media 媒体转发与 M3U8 改写 ★★★
+                // 3. /media 媒体代理 (下载 TS 切片与 Key)
                 uri == "/media" -> {
                     handleMediaProxy(session)
                 }
 
-                // 4. ★★★ 解决有声无画核心：完全复刻 main.go 的 /sapi/ 脚本注入与 IndexedDB 绕过 ★★★
+                // 4. ★ 核心修复：SAPI 资源分流 (二进制 .bin 文件纯字节透传，禁止字符串损坏)
                 uri.startsWith("/sapi/") -> {
-                    handleSapiWithPatch(uri.removePrefix("/sapi/"))
+                    handleSapiSafe(uri.removePrefix("/sapi/"))
                 }
 
-                // 5. 官方 /auth 接口
+                // 5. /auth 接口
                 uri == "/auth" && method == Method.POST -> {
                     val map = HashMap<String, String>()
                     session.parseBody(map)
@@ -65,13 +64,13 @@ class LocalProxyServer(private val context: Context, port: Int = 18888) : NanoHT
                     proxyPost("https://player-api.yangshipin.cn/v1/player/auth", postData, "application/x-www-form-urlencoded", session.headers)
                 }
 
-                // 6. 官方 /open-token 接口
+                // 6. /open-token 接口
                 uri == "/open-token" && method == Method.GET -> {
                     val query = session.queryParameterString ?: ""
                     proxyGet("https://h5access.yangshipin.cn/web/open/token?$query")
                 }
 
-                // 7. 官方 /get-live-info 接口
+                // 7. /get-live-info 接口
                 uri == "/get-live-info" && method == Method.POST -> {
                     val map = HashMap<String, String>()
                     session.parseBody(map)
@@ -79,22 +78,22 @@ class LocalProxyServer(private val context: Context, port: Int = 18888) : NanoHT
                     proxyPost("https://player-api.yangshipin.cn/v1/player/get_live_info", postData, "application/json; charset=utf-8", session.headers)
                 }
 
-                // 8. EPG 节目单
+                // 8. EPG
                 uri.startsWith("/capi/") -> {
                     proxyGet("https://capi.yangshipin.cn" + uri.removePrefix("/capi"))
                 }
 
-                // 9. 湖北台分片转发
+                // 9. 湖北台 TS 切片
                 uri == "/hbtv/ts" -> {
                     handleHbtvTs(params)
                 }
 
-                // 10. 湖北台 M3U8 动态改写
+                // 10. 湖北台 M3U8
                 uri.startsWith("/hbtv/") && uri.endsWith(".m3u8") -> {
                     handleHbtvM3u8(uri)
                 }
 
-                // 11. IPTV M3U 订阅源列表
+                // 11. M3U 列表
                 uri == "/live.m3u" -> {
                     handleLiveM3u(session)
                 }
@@ -117,7 +116,6 @@ class LocalProxyServer(private val context: Context, port: Int = 18888) : NanoHT
         res.addHeader("Access-Control-Allow-Headers", "*")
     }
 
-    // 复刻 main.go: 托管 player.served.html 并加入时间戳防缓存
     private fun servePlayerHtml(): Response {
         return try {
             val html = context.assets.open("player.served.html").bufferedReader().use { it.readText() }
@@ -131,7 +129,6 @@ class LocalProxyServer(private val context: Context, port: Int = 18888) : NanoHT
         }
     }
 
-    // 复刻 main.go 的 /media 转发: 下载 TS 分片、Key、并改写相对 URI 的 M3U8
     private fun handleMediaProxy(session: IHTTPSession): Response {
         val u = session.parameters["u"]?.firstOrNull()
             ?: return newFixedLengthResponse(Response.Status.BAD_REQUEST, "text/plain", "missing u")
@@ -160,7 +157,6 @@ class LocalProxyServer(private val context: Context, port: Int = 18888) : NanoHT
         }
     }
 
-    // 复刻 main.go 的 rewriteM3U8: 把相对路径换算成绝对 CDN URL，保证页面二次改写走 /media
     private fun rewriteM3u8ToAbsolute(body: String, m3u8Url: String): String {
         val base = if (m3u8Url.contains("/")) m3u8Url.substringBeforeLast("/") + "/" else ""
         val resolve = { p: String ->
@@ -174,14 +170,12 @@ class LocalProxyServer(private val context: Context, port: Int = 18888) : NanoHT
             }
         }
 
-        // 1. 独立行
         val lines = body.lines().map { line ->
             val t = line.trim()
             if (t.isEmpty() || t.startsWith("#")) line else resolve(t)
         }
         var out = lines.joinToString("\n")
 
-        // 2. URI="..." 标签
         val p = Pattern.compile("URI=\"([^\"]*)\"")
         val m = p.matcher(out)
         val sb = StringBuffer()
@@ -193,25 +187,33 @@ class LocalProxyServer(private val context: Context, port: Int = 18888) : NanoHT
         return sb.toString()
     }
 
-    // 复刻 main.go 的 /sapi/ 注入：绕过 IndexedDB 门控，强行走 XHR
-    private fun handleSapiWithPatch(filename: String): Response {
+    // ★★★ 核心修复：对 .bin 纯二进制读取，绝不转字符串破坏机器码 ★★★
+    private fun handleSapiSafe(filename: String): Response {
         return try {
             val assetPath = "sapi_cache/$filename"
+
+            // 如果是二进制文件 (.bin)，直接按原字节流返回
+            if (filename.endsWith(".bin")) {
+                val isStream: InputStream = context.assets.open(assetPath)
+                val bytes = isStream.readBytes()
+                val res = newFixedLengthResponse(Response.Status.OK, "application/octet-stream", ByteArrayInputStream(bytes), bytes.size.toLong())
+                res.addHeader("Cache-Control", "no-store, no-cache, must-revalidate, max-age=0")
+                return res
+            }
+
+            // 如果是 JS 脚本，才进行文本读取与补丁注入
             val isStream: InputStream = context.assets.open(assetPath)
             var text = isStream.bufferedReader().use { it.readText() }
 
-            // 替换所有绝对 sapi URL 为本地同源
             text = text.replace("https://sapi.yangshipin.cn", "/sapi")
 
-            // 注入 IndexedDB 绕过补丁 (main.go 核心代码)
             if (text.contains("EM_IDB_STORE")) {
                 val fetchGateOld = "if((!c||\"EM_IDB_STORE\"===r||\"EM_IDB_DELETE\"===r)&&!Fetch.dbInstance)return C(A),0;"
                 val fetchGateNew = "var __cmgRW=function(p){try{var u=UTF8ToString(p);if(/yangshipin\\.cn|cctv\\.cn/.test(u)&&u.indexOf('127.0.0.1')<0){var nu='http://127.0.0.1:18888/media?u='+encodeURIComponent(u);var b=[];for(var i=0;i<nu.length;i++)b.push(nu.charCodeAt(i));b.push(0);var np=_malloc(b.length);if(np){for(var j=0;j<b.length;j++)HEAPU8[np+j]=b[j];HEAPU32[p>>2]=np;return nu;}}}catch(e){}return null;};if(\"EM_IDB_STORE\"!==r&&\"EM_IDB_DELETE\"!==r){try{__cmgRW(HEAPU32[A+8>>2]);}catch(_e){}__emscripten_fetch_xhr(A,o,C,E,Q);return A;}if((!c||\"EM_IDB_STORE\"===r||\"EM_IDB_DELETE\"===r)&&!Fetch.dbInstance)return C(A),0;"
                 text = text.replace(fetchGateOld, fetchGateNew)
             }
 
-            val mime = if (filename.endsWith(".js")) "application/javascript; charset=utf-8" else "application/octet-stream"
-            val res = newFixedLengthResponse(Response.Status.OK, mime, text)
+            val res = newFixedLengthResponse(Response.Status.OK, "application/javascript; charset=utf-8", text)
             res.addHeader("Cache-Control", "no-store, no-cache, must-revalidate, max-age=0")
             res
         } catch (e: Exception) {
