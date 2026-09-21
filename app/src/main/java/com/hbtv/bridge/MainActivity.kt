@@ -254,7 +254,7 @@ class MainActivity : AppCompatActivity() {
         playerWebView.webViewClient = object : WebViewClient() {
             override fun onPageFinished(view: WebView?, url: String?) {
                 if (url != null && url.contains("18888/player")) {
-                    LogManager.log("player.served.html 加载就绪")
+                    LogManager.log("player.served.html 加载完成")
                     val polyfill = """
                         if (!window.chrome) window.chrome = {};
                         if (!window.chrome.webview) {
@@ -265,6 +265,7 @@ class MainActivity : AppCompatActivity() {
                                 }
                             };
                         }
+                        console.log("[内核自检] window.Hls=" + (typeof window.Hls) + " | CMG=" + (typeof window.CNTVH5PlayerModule) + " | __startM3u8=" + (typeof window.__startM3u8));
                     """.trimIndent()
                     playerWebView.evaluateJavascript(polyfill, null)
                     tvCurrentPlaying.text = "掌上电视已就绪 (请选台)"
@@ -455,7 +456,6 @@ class MainActivity : AppCompatActivity() {
         return if (playUrl.isNotEmpty()) playUrl + ext else null
     }
 
-    // ★★★ 核心修复：将播放 URL 统一包装为同源 /media?u=... 彻底消除跨域阻断 ★★★
     private fun startHlsPlay(m3u8Url: String) {
         val localPlayUrl = if (m3u8Url.startsWith("http://127.0.0.1")) {
             m3u8Url
@@ -467,12 +467,12 @@ class MainActivity : AppCompatActivity() {
         val js = """
             (function() {
                 try {
-                    console.log("[Player] 开始装载播放: " + '$safe');
+                    console.log("[Player] 开始装载: " + '$safe');
                     if (typeof window.__startM3u8 === 'function') {
                         window.__startM3u8('$safe');
                         console.log("[Player] __startM3u8 触发成功");
                     } else {
-                        console.error("[Player] 错误: window.__startM3u8 尚未就绪");
+                        console.error("[Player] 错误: window.__startM3u8 尚未就绪，Hls状态=" + (typeof window.Hls));
                     }
                     setTimeout(function() {
                         var video = document.getElementById('v') || document.querySelector('video');
@@ -485,17 +485,17 @@ class MainActivity : AppCompatActivity() {
                             video.play().then(function() {
                                 console.log("[Player] 视频播放起播成功 (video.play OK)");
                             }).catch(function(e) {
-                                console.warn("[Player] 自动播放拦截: " + e.message + "，尝试静音起播后恢复声音");
+                                console.warn("[Player] 自动起播拦截: " + e.message);
                                 video.muted = true;
                                 video.play().then(function() {
                                     video.muted = false;
-                                    console.log("[Player] 已成功通过兼容模式激活画面与声音");
+                                    console.log("[Player] 已通过兼容模式激活画面与声音");
                                 });
                             });
                         }
                     }, 600);
                 } catch(e) {
-                    console.error("[Player] startHlsPlay 异常: " + e.message);
+                    console.error("[Player] startHlsPlay 抛出异常: " + e.message);
                 }
             })();
         """.trimIndent()
