@@ -36,27 +36,23 @@ class LocalProxyServer(private val context: Context, port: Int = 18888) : NanoHT
 
         return try {
             val response = when {
-                // 1. 播放主页面
                 uri == "/" || uri == "/player" -> {
                     servePlayerHtml()
                 }
 
-                // 2. CMGPlayer.json 解密配置
                 uri == "/Library/CMGPlayer.json" -> {
                     serveAssetOrMockJson("CMGPlayer.json", "{\"code\":0,\"data\":{\"switch\":1}}")
                 }
 
-                // 3. /media 媒体代理 (下载 TS 切片与 Key)
                 uri == "/media" -> {
                     handleMediaProxy(session)
                 }
 
-                // 4. ★★★ 核心修复：SAPI 路径斜杠与下划线智能换算，彻底解决 hls.cmg.js 404 ★★★
+                // ★★★ 核心攻关：对 hls.cmg.js 注入 earlyWrap 与 cmgDecNew 原地补解密 ★★★
                 uri.startsWith("/sapi") -> {
-                    handleSapiSmart(uri)
+                    handleSapiSmartWithPatches(uri)
                 }
 
-                // 5. /auth 接口
                 uri == "/auth" && method == Method.POST -> {
                     val map = HashMap<String, String>()
                     session.parseBody(map)
@@ -64,13 +60,11 @@ class LocalProxyServer(private val context: Context, port: Int = 18888) : NanoHT
                     proxyPost("https://player-api.yangshipin.cn/v1/player/auth", postData, "application/x-www-form-urlencoded", session.headers)
                 }
 
-                // 6. /open-token 接口
                 uri == "/open-token" && method == Method.GET -> {
                     val query = session.queryParameterString ?: ""
                     proxyGet("https://h5access.yangshipin.cn/web/open/token?$query")
                 }
 
-                // 7. /get-live-info 接口
                 uri == "/get-live-info" && method == Method.POST -> {
                     val map = HashMap<String, String>()
                     session.parseBody(map)
@@ -78,22 +72,18 @@ class LocalProxyServer(private val context: Context, port: Int = 18888) : NanoHT
                     proxyPost("https://player-api.yangshipin.cn/v1/player/get_live_info", postData, "application/json; charset=utf-8", session.headers)
                 }
 
-                // 8. EPG
                 uri.startsWith("/capi/") -> {
                     proxyGet("https://capi.yangshipin.cn" + uri.removePrefix("/capi"))
                 }
 
-                // 9. 湖北台 TS 切片
                 uri == "/hbtv/ts" -> {
                     handleHbtvTs(params)
                 }
 
-                // 10. 湖北台 M3U8
                 uri.startsWith("/hbtv/") && uri.endsWith(".m3u8") -> {
                     handleHbtvM3u8(uri)
                 }
 
-                // 11. M3U 列表
                 uri == "/live.m3u" -> {
                     handleLiveM3u(session)
                 }
@@ -152,13 +142,13 @@ class LocalProxyServer(private val context: Context, port: Int = 18888) : NanoHT
         return if (isM3U8) {
             val raw = resp.body?.string() ?: ""
             val rewritten = rewriteM3u8ToAbsolute(raw, u)
-            LogManager.log("[Media代理] 成功输出 M3U8")
+            LogManager.log("[Media代理] 成功解析 M3U8")
             val res = newFixedLengthResponse(Response.Status.OK, "application/vnd.apple.mpegurl", rewritten)
             res.addHeader("Cache-Control", "no-store, no-cache, must-revalidate, max-age=0")
             res
         } else {
             val bytes = resp.body?.bytes() ?: ByteArray(0)
-            LogManager.log("[Media代理] 输出切片: ${bytes.size / 1024} KB")
+            LogManager.log("[Media代理] 传输切片: ${bytes.size / 1024} KB")
             newFixedLengthResponse(Response.Status.OK, ct, ByteArrayInputStream(bytes), bytes.size.toLong())
         }
     }
@@ -193,36 +183,85 @@ class LocalProxyServer(private val context: Context, port: Int = 18888) : NanoHT
         return sb.toString()
     }
 
-    // ★★★ 核心算法还原：对齐 main.go 把 / 自动换算为 _，杜绝 404 ★★★
-    private fun handleSapiSmart(uri: String): Response {
+    // ★★★ 核心还原：把 main.go 里针对 hls.cmg.js 的 VMPATCH3 内存热修补与 FIX-PB 原地补解密完整注入 ★★★
+    private fun handleSapiSmartWithPatches(uri: String): Response {
         val pathOnly = if (uri.contains('?')) uri.substringBefore('?') else uri
         val rawSub = pathOnly.removePrefix("/sapi").trim('/')
-        val cacheKey = rawSub.replace('/', '_') // 如 assets/2025/wasm/hls.cmg.js -> assets_2025_wasm_hls.cmg.js
+        val cacheKey = rawSub.replace('/', '_')
 
-        val candidates = listOf(
-            "sapi_cache/$cacheKey",
-            "sapi_cache/$rawSub",
-            cacheKey,
-            rawSub
-        )
+        val candidates = listOf("sapi_cache/$cacheKey", "sapi_cache/$rawSub", cacheKey, rawSub)
 
         for (assetPath in candidates) {
             try {
                 if (assetPath.endsWith(".bin")) {
                     val bytes = context.assets.open(assetPath).readBytes()
-                    LogManager.log("[SAPI] 命中二进制: $assetPath (${bytes.size}B)")
                     val res = newFixedLengthResponse(Response.Status.OK, "application/octet-stream", ByteArrayInputStream(bytes), bytes.size.toLong())
                     res.addHeader("Cache-Control", "no-store, no-cache, must-revalidate, max-age=0")
                     return res
                 } else {
                     var text = context.assets.open(assetPath).bufferedReader().use { it.readText() }
-                    LogManager.log("[SAPI] 命中脚本: $assetPath")
                     text = text.replace("https://sapi.yangshipin.cn", "/sapi")
 
+                    // 1. 注入 IndexedDB 绕过补丁
                     if (text.contains("EM_IDB_STORE")) {
                         val fetchGateOld = "if((!c||\"EM_IDB_STORE\"===r||\"EM_IDB_DELETE\"===r)&&!Fetch.dbInstance)return C(A),0;"
                         val fetchGateNew = "var __cmgRW=function(p){try{var u=UTF8ToString(p);if(/yangshipin\\.cn|cctv\\.cn/.test(u)&&u.indexOf('127.0.0.1')<0){var nu='http://127.0.0.1:18888/media?u='+encodeURIComponent(u);var b=[];for(var i=0;i<nu.length;i++)b.push(nu.charCodeAt(i));b.push(0);var np=_malloc(b.length);if(np){for(var j=0;j<b.length;j++)HEAPU8[np+j]=b[j];HEAPU32[p>>2]=np;return nu;}}}catch(e){}return null;};if(\"EM_IDB_STORE\"!==r&&\"EM_IDB_DELETE\"!==r){try{__cmgRW(HEAPU32[A+8>>2]);}catch(_e){}__emscripten_fetch_xhr(A,o,C,E,Q);return A;}if((!c||\"EM_IDB_STORE\"===r||\"EM_IDB_DELETE\"===r)&&!Fetch.dbInstance)return C(A),0;"
                         text = text.replace(fetchGateOld, fetchGateNew)
+                    }
+
+                    // 2. ★ 注入 main.go 的 earlyWrap (VMPATCH3 内存热修补) 与 cmgDecNew (P/B帧原地解密) ★
+                    if (assetPath.contains("hls.cmg.js")) {
+                        LogManager.log("[SAPI] 正在为 hls.cmg.js 注入 VMPATCH3 与 P/B 帧原地解密补丁...")
+                        
+                        val earlyWrap = """
+                            (function(){
+                              if(window.__cmgEarlyInstalled) return;
+                              window.__cmgEarlyInstalled = true;
+                              var __vmBlocks={},__vmReady=false;
+                              setTimeout(function(){
+                                try{
+                                  var mod=window.CNTVH5PlayerModule;
+                                  var u8=mod&&mod.HEAPU8||(mod&&mod.asm&&mod.asm.memory&&new Uint8Array(mod.asm.memory.buffer));
+                                  if(!u8)return;
+                                  var cap=Math.min(u8.length,6700000);
+                                  for(var off=6300000;off<cap;off+=4096){
+                                    var nz=0;
+                                    for(var k=off;k<off+4096&&k<u8.length;k++){if(u8[k]!==0)nz++;}
+                                    if(nz>0){__vmBlocks[off]=new Uint8Array(u8.slice(off,off+4096));}
+                                  }
+                                  __vmReady=true;
+                                  if(window.chrome&&window.chrome.webview)window.chrome.webview.postMessage({log:"[VMPATCH3] 内存快照就绪"});
+                                }catch(e){}
+                              },6000);
+                              setInterval(function(){
+                                try{
+                                  var mod=window.CNTVH5PlayerModule;
+                                  var u8=mod&&mod.HEAPU8||(mod&&mod.asm&&mod.asm.memory&&new Uint8Array(mod.asm.memory.buffer));
+                                  if(!u8||!__vmReady)return;
+                                  for(var off in __vmBlocks){
+                                    var saved=__vmBlocks[off];
+                                    var o=Number(off);
+                                    var diff=0;
+                                    for(var k=0;k<4096&&o+k<u8.length;k++){if(u8[o+k]!==saved[k])diff++;}
+                                    if(diff>0&&diff<=2048){
+                                      for(var k=0;k<4096&&o+k<u8.length;k++){if(u8[o+k]!==saved[k])u8[o+k]=saved[k];}
+                                    }
+                                  }
+                                }catch(e){}
+                              },2000);
+                            })();
+                        """.trimIndent()
+                        
+                        text = earlyWrap + "\n" + text
+
+                        val cmgDecOld = "fG[wz(0x6bf)](jJ[wz(0x97f)],jJ['config'][wz(0x291)],jN[wz(0x944)],fG[wz(0x9d2)])"
+                        val cmgDecOld2 = "fG[wz(0x6bf)](jJ[wz(0x97f)],jJ[wz(0xb0b)][wz(0x291)],jN[wz(0x944)],fG[wz(0x22f)])"
+                        
+                        val cmgDecNew = "(function(__in){var __m=jJ[wz(0x97f)],__ts=jJ['config'][wz(0x291)],__k=fG[wz(0x9d2)],__mt=(jJ[wz(0xb0b)]&&jJ[wz(0xb0b)]['mediaTagId'])!=null?jJ[wz(0xb0b)]['mediaTagId']:'NULL';var __out=fG[wz(0x6bf)](__m,__ts,__in,__k);try{if(jN['type']===0x5){try{var __wd=(jN[0x944]&&jN[0x944].slice)?jN[0x944].slice(0x0):new Uint8Array([0x65,0x01,0x00,0x00,0x00,0x00,0x00,0x00]);__wd[0x0]=0x41;fG[wz(0x6bf)](__m,__ts,__wd,__k);}catch(e){}}}catch(e){}return __out;})(jN[wz(0x944)])"
+                        val cmgDecNew2 = "(function(__in){var __m=jJ[wz(0x97f)],__lvl=jJ[wz(0xb0b)]||{},__ts=__lvl[wz(0x291)],__k=fG[wz(0x22f)],__mt=(jJ[wz(0xb0b)]&&jJ[wz(0xb0b)]['mediaTagId'])!=null?jJ[wz(0xb0b)]['mediaTagId']:'NULL';var __out=fG[wz(0x6bf)](__m,__ts,__in,__k);try{if(jN['type']===0x5){try{var __wd=(jN[0x944]&&jN[0x944].slice)?jN[0x944].slice(0x0):new Uint8Array([0x65,0x01,0x00,0x00,0x00,0x00,0x00,0x00]);__wd[0x0]=0x41;fG[wz(0x6bf)](__m,__ts,__wd,__k);}catch(e){}}}catch(e){}return __out;})(jN[wz(0x944)])"
+
+                        text = text.replace(cmgDecOld, cmgDecNew)
+                        text = text.replace(cmgDecOld2, cmgDecNew2)
                     }
 
                     val mime = if (assetPath.endsWith(".js")) "application/javascript; charset=utf-8" else "application/octet-stream"
@@ -235,7 +274,6 @@ class LocalProxyServer(private val context: Context, port: Int = 18888) : NanoHT
             }
         }
 
-        LogManager.log("[SAPI 404] 缺失: $rawSub (寻找 key: $cacheKey)")
         return newFixedLengthResponse(Response.Status.NOT_FOUND, "text/plain", "Asset not found: $rawSub")
     }
 
