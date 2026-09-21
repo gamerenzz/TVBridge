@@ -10,7 +10,7 @@
         android:layout_width="match_parent"
         android:layout_height="match_parent" />
 
-    <!-- 2. 顶部微型状态浮条 (半透明，5秒后可淡化) -->
+    <!-- 2. 顶部微型状态浮条 -->
     <LinearLayout
         android:id="@+id/topBar"
         android:layout_width="match_parent"
@@ -56,7 +56,7 @@
             android:textSize="11sp" />
     </LinearLayout>
 
-    <!-- 3. 横屏专用：左侧半透明沉浸式切台抽屉 (初始打开) -->
+    <!-- 3. 左侧半透明悬浮切台抽屉 -->
     <LinearLayout
         android:id="@+id/channelDrawer"
         android:layout_width="260dp"
@@ -117,36 +117,76 @@
             android:paddingTop="6dp" />
     </LinearLayout>
 
-    <!-- 4. 实时日志控制台 -->
+    <!-- 4. ★ 实时日志控制台 (支持长按单选、划选、全选复制与一键复制) ★ -->
     <LinearLayout
         android:id="@+id/logOverlay"
-        android:layout_width="400dp"
-        android:layout_height="220dp"
+        android:layout_width="480dp"
+        android:layout_height="260dp"
         android:layout_gravity="bottom|end"
-        android:background="#D9000000"
+        android:background="#F2000000"
         android:orientation="vertical"
         android:padding="8dp"
         android:visibility="gone">
 
+        <!-- 控制台顶栏操作区 -->
         <LinearLayout
             android:layout_width="match_parent"
             android:layout_height="wrap_content"
+            android:gravity="center_vertical"
             android:orientation="horizontal">
 
             <TextView
                 android:layout_width="0dp"
                 android:layout_height="wrap_content"
                 android:layout_weight="1"
-                android:text="实时运行日志:"
+                android:text="运行日志 (长按文本可划选/全选):"
                 android:textColor="#00E676"
+                android:textSize="11sp"
+                android:textStyle="bold" />
+
+            <TextView
+                android:id="@+id/btnCopyAllLogs"
+                android:layout_width="wrap_content"
+                android:layout_height="wrap_content"
+                android:layout_marginEnd="8dp"
+                android:background="#00897B"
+                android:clickable="true"
+                android:focusable="true"
+                android:paddingStart="8dp"
+                android:paddingTop="4dp"
+                android:paddingEnd="8dp"
+                android:paddingBottom="4dp"
+                android:text="复制全部"
+                android:textColor="#FFFFFF"
+                android:textSize="11sp" />
+
+            <TextView
+                android:id="@+id/btnClearLogs"
+                android:layout_width="wrap_content"
+                android:layout_height="wrap_content"
+                android:layout_marginEnd="8dp"
+                android:background="#424242"
+                android:clickable="true"
+                android:focusable="true"
+                android:paddingStart="8dp"
+                android:paddingTop="4dp"
+                android:paddingEnd="8dp"
+                android:paddingBottom="4dp"
+                android:text="清空"
+                android:textColor="#FF5252"
                 android:textSize="11sp" />
 
             <TextView
                 android:id="@+id/btnCloseLogs"
                 android:layout_width="wrap_content"
                 android:layout_height="wrap_content"
+                android:background="#333333"
                 android:clickable="true"
                 android:focusable="true"
+                android:paddingStart="8dp"
+                android:paddingTop="4dp"
+                android:paddingEnd="8dp"
+                android:paddingBottom="4dp"
                 android:text="关闭 ✕"
                 android:textColor="#FFFFFF"
                 android:textSize="11sp" />
@@ -156,15 +196,24 @@
             android:id="@+id/logScrollView"
             android:layout_width="match_parent"
             android:layout_height="match_parent"
-            android:layout_marginTop="4dp">
+            android:layout_marginTop="6dp"
+            android:background="#151515"
+            android:padding="6dp">
 
+            <!-- 开启 textIsSelectable 允许自由长按选词、全选、复制 -->
             <TextView
                 android:id="@+id/tvConsoleLogs"
                 android:layout_width="match_parent"
                 android:layout_height="wrap_content"
+                android:clickable="true"
+                android:focusable="true"
+                android:focusableInTouchMode="true"
                 android:fontFamily="monospace"
+                android:longClickable="true"
+                android:text="日志就绪..."
                 android:textColor="#A7FFEB"
-                android:textSize="10sp" />
+                android:textIsSelectable="true"
+                android:textSize="11sp" />
         </ScrollView>
     </LinearLayout>
 
