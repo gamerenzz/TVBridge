@@ -46,14 +46,14 @@ class LocalProxyServer(private val context: Context, port: Int = 18888) : NanoHT
                     serveAssetOrMockJson("CMGPlayer.json", "{\"code\":0,\"data\":{\"switch\":1}}")
                 }
 
-                // 3. 核心 /media 媒体代理 (下载 TS 切片与 Key)
+                // 3. /media 媒体代理 (下载 TS 切片与 Key)
                 uri == "/media" -> {
                     handleMediaProxy(session)
                 }
 
-                // 4. SAPI 资源分流 (二进制 .bin 文件纯字节透传)
-                uri.startsWith("/sapi/") -> {
-                    handleSapiSafe(uri.removePrefix("/sapi/"))
+                // 4. ★★★ 核心修复：SAPI 路径斜杠与下划线智能换算，彻底解决 hls.cmg.js 404 ★★★
+                uri.startsWith("/sapi") -> {
+                    handleSapiSmart(uri)
                 }
 
                 // 5. /auth 接口
@@ -152,13 +152,13 @@ class LocalProxyServer(private val context: Context, port: Int = 18888) : NanoHT
         return if (isM3U8) {
             val raw = resp.body?.string() ?: ""
             val rewritten = rewriteM3u8ToAbsolute(raw, u)
-            LogManager.log("[Media代理] 成功解析 M3U8")
+            LogManager.log("[Media代理] 成功输出 M3U8")
             val res = newFixedLengthResponse(Response.Status.OK, "application/vnd.apple.mpegurl", rewritten)
             res.addHeader("Cache-Control", "no-store, no-cache, must-revalidate, max-age=0")
             res
         } else {
             val bytes = resp.body?.bytes() ?: ByteArray(0)
-            LogManager.log("[Media代理] 传输切片: ${bytes.size / 1024} KB")
+            LogManager.log("[Media代理] 输出切片: ${bytes.size / 1024} KB")
             newFixedLengthResponse(Response.Status.OK, ct, ByteArrayInputStream(bytes), bytes.size.toLong())
         }
     }
@@ -193,35 +193,50 @@ class LocalProxyServer(private val context: Context, port: Int = 18888) : NanoHT
         return sb.toString()
     }
 
-    private fun handleSapiSafe(filename: String): Response {
-        return try {
-            val assetPath = "sapi_cache/$filename"
+    // ★★★ 核心算法还原：对齐 main.go 把 / 自动换算为 _，杜绝 404 ★★★
+    private fun handleSapiSmart(uri: String): Response {
+        val pathOnly = if (uri.contains('?')) uri.substringBefore('?') else uri
+        val rawSub = pathOnly.removePrefix("/sapi").trim('/')
+        val cacheKey = rawSub.replace('/', '_') // 如 assets/2025/wasm/hls.cmg.js -> assets_2025_wasm_hls.cmg.js
 
-            if (filename.endsWith(".bin")) {
-                val isStream: InputStream = context.assets.open(assetPath)
-                val bytes = isStream.readBytes()
-                val res = newFixedLengthResponse(Response.Status.OK, "application/octet-stream", ByteArrayInputStream(bytes), bytes.size.toLong())
-                res.addHeader("Cache-Control", "no-store, no-cache, must-revalidate, max-age=0")
-                return res
+        val candidates = listOf(
+            "sapi_cache/$cacheKey",
+            "sapi_cache/$rawSub",
+            cacheKey,
+            rawSub
+        )
+
+        for (assetPath in candidates) {
+            try {
+                if (assetPath.endsWith(".bin")) {
+                    val bytes = context.assets.open(assetPath).readBytes()
+                    LogManager.log("[SAPI] 命中二进制: $assetPath (${bytes.size}B)")
+                    val res = newFixedLengthResponse(Response.Status.OK, "application/octet-stream", ByteArrayInputStream(bytes), bytes.size.toLong())
+                    res.addHeader("Cache-Control", "no-store, no-cache, must-revalidate, max-age=0")
+                    return res
+                } else {
+                    var text = context.assets.open(assetPath).bufferedReader().use { it.readText() }
+                    LogManager.log("[SAPI] 命中脚本: $assetPath")
+                    text = text.replace("https://sapi.yangshipin.cn", "/sapi")
+
+                    if (text.contains("EM_IDB_STORE")) {
+                        val fetchGateOld = "if((!c||\"EM_IDB_STORE\"===r||\"EM_IDB_DELETE\"===r)&&!Fetch.dbInstance)return C(A),0;"
+                        val fetchGateNew = "var __cmgRW=function(p){try{var u=UTF8ToString(p);if(/yangshipin\\.cn|cctv\\.cn/.test(u)&&u.indexOf('127.0.0.1')<0){var nu='http://127.0.0.1:18888/media?u='+encodeURIComponent(u);var b=[];for(var i=0;i<nu.length;i++)b.push(nu.charCodeAt(i));b.push(0);var np=_malloc(b.length);if(np){for(var j=0;j<b.length;j++)HEAPU8[np+j]=b[j];HEAPU32[p>>2]=np;return nu;}}}catch(e){}return null;};if(\"EM_IDB_STORE\"!==r&&\"EM_IDB_DELETE\"!==r){try{__cmgRW(HEAPU32[A+8>>2]);}catch(_e){}__emscripten_fetch_xhr(A,o,C,E,Q);return A;}if((!c||\"EM_IDB_STORE\"===r||\"EM_IDB_DELETE\"===r)&&!Fetch.dbInstance)return C(A),0;"
+                        text = text.replace(fetchGateOld, fetchGateNew)
+                    }
+
+                    val mime = if (assetPath.endsWith(".js")) "application/javascript; charset=utf-8" else "application/octet-stream"
+                    val res = newFixedLengthResponse(Response.Status.OK, mime, text)
+                    res.addHeader("Cache-Control", "no-store, no-cache, must-revalidate, max-age=0")
+                    return res
+                }
+            } catch (e: Exception) {
+                // 尝试下一个候选路径
             }
-
-            val isStream: InputStream = context.assets.open(assetPath)
-            var text = isStream.bufferedReader().use { it.readText() }
-
-            text = text.replace("https://sapi.yangshipin.cn", "/sapi")
-
-            if (text.contains("EM_IDB_STORE")) {
-                val fetchGateOld = "if((!c||\"EM_IDB_STORE\"===r||\"EM_IDB_DELETE\"===r)&&!Fetch.dbInstance)return C(A),0;"
-                val fetchGateNew = "var __cmgRW=function(p){try{var u=UTF8ToString(p);if(/yangshipin\\.cn|cctv\\.cn/.test(u)&&u.indexOf('127.0.0.1')<0){var nu='http://127.0.0.1:18888/media?u='+encodeURIComponent(u);var b=[];for(var i=0;i<nu.length;i++)b.push(nu.charCodeAt(i));b.push(0);var np=_malloc(b.length);if(np){for(var j=0;j<b.length;j++)HEAPU8[np+j]=b[j];HEAPU32[p>>2]=np;return nu;}}}catch(e){}return null;};if(\"EM_IDB_STORE\"!==r&&\"EM_IDB_DELETE\"!==r){try{__cmgRW(HEAPU32[A+8>>2]);}catch(_e){}__emscripten_fetch_xhr(A,o,C,E,Q);return A;}if((!c||\"EM_IDB_STORE\"===r||\"EM_IDB_DELETE\"===r)&&!Fetch.dbInstance)return C(A),0;"
-                text = text.replace(fetchGateOld, fetchGateNew)
-            }
-
-            val res = newFixedLengthResponse(Response.Status.OK, "application/javascript; charset=utf-8", text)
-            res.addHeader("Cache-Control", "no-store, no-cache, must-revalidate, max-age=0")
-            res
-        } catch (e: Exception) {
-            newFixedLengthResponse(Response.Status.NOT_FOUND, "text/plain", "Asset not found: $filename")
         }
+
+        LogManager.log("[SAPI 404] 缺失: $rawSub (寻找 key: $cacheKey)")
+        return newFixedLengthResponse(Response.Status.NOT_FOUND, "text/plain", "Asset not found: $rawSub")
     }
 
     private fun serveAssetOrMockJson(assetName: String, fallbackJson: String): Response {
@@ -268,6 +283,7 @@ class LocalProxyServer(private val context: Context, port: Int = 18888) : NanoHT
                 line
             }
         }
+        LogManager.log("[湖北代理] 成功改写 M3U8 ($cid)")
         return newFixedLengthResponse(Response.Status.OK, "application/vnd.apple.mpegurl", modified)
     }
 
