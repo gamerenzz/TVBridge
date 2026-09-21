@@ -1,16 +1,29 @@
 <?xml version="1.0" encoding="utf-8"?>
 <FrameLayout xmlns:android="http://schemas.android.com/apk/res/android"
+    xmlns:app="http://schemas.android.com/apk/res-auto"
     android:layout_width="match_parent"
     android:layout_height="match_parent"
-    android:background="#000000">
+    android:background="#000000"
+    android:fitsSystemWindows="true">
 
-    <!-- 1. 全屏硬件加速播放内核 (加载 player.served.html) -->
-    <WebView
-        android:id="@+id/playerWebView"
+    <!-- 1. Google 原生 ExoPlayer 硬件解码视频视图 (16:9 智能适配，无拉伸) -->
+    <androidx.media3.ui.PlayerView
+        android:id="@+id/nativePlayerView"
         android:layout_width="match_parent"
-        android:layout_height="match_parent" />
+        android:layout_height="match_parent"
+        app:resize_mode="fit"
+        app:use_controller="false" />
 
-    <!-- 2. 顶部状态栏 -->
+    <!-- 缓冲加载菊花 -->
+    <ProgressBar
+        android:id="@+id/bufferingProgress"
+        android:layout_width="48dp"
+        android:layout_height="48dp"
+        android:layout_gravity="center"
+        android:indeterminateTint="#2F6BFF"
+        android:visibility="gone" />
+
+    <!-- 2. 顶部微型状态浮条 -->
     <LinearLayout
         android:id="@+id/topBar"
         android:layout_width="match_parent"
@@ -35,13 +48,35 @@
             android:textStyle="bold" />
 
         <Button
+            android:id="@+id/btnCopyM3u"
+            android:layout_width="wrap_content"
+            android:layout_height="32dp"
+            android:layout_marginEnd="8dp"
+            android:backgroundTint="#00897B"
+            android:focusable="true"
+            android:text="📋 复制源"
+            android:textColor="#FFFFFF"
+            android:textSize="11sp" />
+
+        <Button
+            android:id="@+id/btnMinimize"
+            android:layout_width="wrap_content"
+            android:layout_height="32dp"
+            android:layout_marginEnd="8dp"
+            android:backgroundTint="#FF8F00"
+            android:focusable="true"
+            android:text="🗕 后台"
+            android:textColor="#FFFFFF"
+            android:textSize="11sp" />
+
+        <Button
             android:id="@+id/btnToggleLogs"
             android:layout_width="wrap_content"
             android:layout_height="32dp"
             android:layout_marginEnd="8dp"
             android:backgroundTint="#333333"
             android:focusable="true"
-            android:text="📋 日志"
+            android:text="日志"
             android:textColor="#FFFFFF"
             android:textSize="11sp" />
 
@@ -51,12 +86,12 @@
             android:layout_height="32dp"
             android:backgroundTint="#2F6BFF"
             android:focusable="true"
-            android:text="频道列表 ☰"
+            android:text="选台 ☰"
             android:textColor="#FFFFFF"
             android:textSize="11sp" />
     </LinearLayout>
 
-    <!-- 3. 左侧半透明悬浮切台抽屉 (初始可见) -->
+    <!-- 3. 左侧半透明悬浮切台抽屉 (初始展开，方便选台) -->
     <LinearLayout
         android:id="@+id/channelDrawer"
         android:layout_width="260dp"
@@ -75,7 +110,6 @@
             android:textSize="16sp"
             android:textStyle="bold" />
 
-        <!-- 分类切换 -->
         <LinearLayout
             android:layout_width="match_parent"
             android:layout_height="wrap_content"
@@ -118,7 +152,7 @@
             android:paddingTop="6dp" />
     </LinearLayout>
 
-    <!-- 4. 实时日志控制台 (支持复制全部、清空、长按选词) -->
+    <!-- 4. 实时日志控制台 -->
     <LinearLayout
         android:id="@+id/logOverlay"
         android:layout_width="460dp"
