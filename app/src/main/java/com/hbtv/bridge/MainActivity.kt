@@ -1,6 +1,9 @@
 package com.hbtv.bridge
 
 import android.annotation.SuppressLint
+import android.content.ClipData
+import android.content.ClipboardManager
+import android.content.Context
 import android.content.Intent
 import android.content.pm.ActivityInfo
 import android.graphics.Bitmap
@@ -14,6 +17,7 @@ import android.webkit.*
 import android.widget.Button
 import android.widget.ScrollView
 import android.widget.TextView
+import android.widget.Toast
 import androidx.appcompat.app.AppCompatActivity
 import androidx.recyclerview.widget.LinearLayoutManager
 import androidx.recyclerview.widget.RecyclerView
@@ -85,7 +89,6 @@ class MainActivity : AppCompatActivity() {
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
-        // 1. 强制横屏锁定
         requestedOrientation = ActivityInfo.SCREEN_ORIENTATION_SENSOR_LANDSCAPE
         hideSystemUI()
 
@@ -104,10 +107,35 @@ class MainActivity : AppCompatActivity() {
         val btnToggleDrawer = findViewById<Button>(R.id.btnToggleDrawer)
         val btnToggleLogs = findViewById<Button>(R.id.btnToggleLogs)
         val btnCloseLogs = findViewById<TextView>(R.id.btnCloseLogs)
+        val btnCopyAllLogs = findViewById<TextView>(R.id.btnCopyAllLogs)
+        val btnClearLogs = findViewById<TextView>(R.id.btnClearLogs)
 
         val tabCctv = findViewById<Button>(R.id.tabCctv)
         val tabSatellite = findViewById<Button>(R.id.tabSatellite)
         val tabLocal = findViewById<Button>(R.id.tabLocal)
+
+        // 确保 TextView 可自由选词、全选
+        tvConsoleLogs.setTextIsSelectable(true)
+
+        // 1. 【一键复制全部日志】
+        btnCopyAllLogs.setOnClickListener {
+            val allLogs = LogManager.getAllLogs()
+            if (allLogs.isNotEmpty()) {
+                val clipboard = getSystemService(Context.CLIPBOARD_SERVICE) as ClipboardManager
+                val clip = ClipData.newPlainText("PalmTV_Logs", allLogs)
+                clipboard.setPrimaryClip(clip)
+                Toast.makeText(this, "全部日志已复制到剪贴板", Toast.LENGTH_SHORT).show()
+            } else {
+                Toast.makeText(this, "暂无日志", Toast.LENGTH_SHORT).show()
+            }
+        }
+
+        // 2. 【清空日志】
+        btnClearLogs.setOnClickListener {
+            LogManager.clear()
+            tvConsoleLogs.text = ""
+            Toast.makeText(this, "日志已清空", Toast.LENGTH_SHORT).show()
+        }
 
         LogManager.onLogListener = {
             runOnUiThread {
@@ -174,7 +202,6 @@ class MainActivity : AppCompatActivity() {
 
     @SuppressLint("SetJavaScriptEnabled")
     private fun initPlayerWebView() {
-        // ★ 核心：强制开启硬件加速图层，让 H.264 视频解码帧直接上屏
         playerWebView.setLayerType(View.LAYER_TYPE_HARDWARE, null)
 
         playerWebView.settings.apply {
@@ -431,7 +458,6 @@ class MainActivity : AppCompatActivity() {
         return if (playUrl.isNotEmpty()) playUrl + ext else null
     }
 
-    // 解决有声无画核心：强制将视频图层挂满屏幕并铺开
     private fun startHlsPlay(m3u8Url: String) {
         val safe = m3u8Url.replace("'", "\\'")
         val js = """
