@@ -46,12 +46,12 @@ class LocalProxyServer(private val context: Context, port: Int = 18888) : NanoHT
                     serveAssetOrMockJson("CMGPlayer.json", "{\"code\":0,\"data\":{\"switch\":1}}")
                 }
 
-                // 3. /media 媒体代理 (下载 TS 切片与 Key)
+                // 3. 核心 /media 媒体代理 (下载 TS 切片与 Key)
                 uri == "/media" -> {
                     handleMediaProxy(session)
                 }
 
-                // 4. ★ 核心修复：SAPI 资源分流 (二进制 .bin 文件纯字节透传，禁止字符串损坏)
+                // 4. SAPI 资源分流 (二进制 .bin 文件纯字节透传)
                 uri.startsWith("/sapi/") -> {
                     handleSapiSafe(uri.removePrefix("/sapi/"))
                 }
@@ -133,6 +133,8 @@ class LocalProxyServer(private val context: Context, port: Int = 18888) : NanoHT
         val u = session.parameters["u"]?.firstOrNull()
             ?: return newFixedLengthResponse(Response.Status.BAD_REQUEST, "text/plain", "missing u")
 
+        LogManager.log("[Media代理] 抓取: ${u.take(55)}...")
+
         val reqBuilder = Request.Builder().url(u)
             .header("User-Agent", chromeUA)
             .header("Referer", "https://yangshipin.cn/")
@@ -150,9 +152,13 @@ class LocalProxyServer(private val context: Context, port: Int = 18888) : NanoHT
         return if (isM3U8) {
             val raw = resp.body?.string() ?: ""
             val rewritten = rewriteM3u8ToAbsolute(raw, u)
-            newFixedLengthResponse(Response.Status.OK, ct, rewritten)
+            LogManager.log("[Media代理] 成功解析 M3U8")
+            val res = newFixedLengthResponse(Response.Status.OK, "application/vnd.apple.mpegurl", rewritten)
+            res.addHeader("Cache-Control", "no-store, no-cache, must-revalidate, max-age=0")
+            res
         } else {
             val bytes = resp.body?.bytes() ?: ByteArray(0)
+            LogManager.log("[Media代理] 传输切片: ${bytes.size / 1024} KB")
             newFixedLengthResponse(Response.Status.OK, ct, ByteArrayInputStream(bytes), bytes.size.toLong())
         }
     }
@@ -187,12 +193,10 @@ class LocalProxyServer(private val context: Context, port: Int = 18888) : NanoHT
         return sb.toString()
     }
 
-    // ★★★ 核心修复：对 .bin 纯二进制读取，绝不转字符串破坏机器码 ★★★
     private fun handleSapiSafe(filename: String): Response {
         return try {
             val assetPath = "sapi_cache/$filename"
 
-            // 如果是二进制文件 (.bin)，直接按原字节流返回
             if (filename.endsWith(".bin")) {
                 val isStream: InputStream = context.assets.open(assetPath)
                 val bytes = isStream.readBytes()
@@ -201,7 +205,6 @@ class LocalProxyServer(private val context: Context, port: Int = 18888) : NanoHT
                 return res
             }
 
-            // 如果是 JS 脚本，才进行文本读取与补丁注入
             val isStream: InputStream = context.assets.open(assetPath)
             var text = isStream.bufferedReader().use { it.readText() }
 
@@ -239,6 +242,7 @@ class LocalProxyServer(private val context: Context, port: Int = 18888) : NanoHT
             .build()
         val resp = client.newCall(req).execute()
         val bytes = resp.body?.bytes() ?: ByteArray(0)
+        LogManager.log("[湖北代理] 传输切片: ${bytes.size / 1024} KB")
         return newFixedLengthResponse(Response.Status.OK, "video/mp2t", ByteArrayInputStream(bytes), bytes.size.toLong())
     }
 
