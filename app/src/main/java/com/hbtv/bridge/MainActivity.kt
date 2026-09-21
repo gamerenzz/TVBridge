@@ -25,6 +25,7 @@ import okhttp3.*
 import okhttp3.MediaType.Companion.toMediaType
 import okhttp3.RequestBody.Companion.toRequestBody
 import org.json.JSONObject
+import java.net.URLEncoder
 import java.text.SimpleDateFormat
 import java.util.*
 import java.util.concurrent.CopyOnWriteArrayList
@@ -208,6 +209,8 @@ class MainActivity : AppCompatActivity() {
             cacheMode = WebSettings.LOAD_NO_CACHE
             useWideViewPort = true
             loadWithOverviewMode = true
+            allowFileAccess = true
+            allowContentAccess = true
         }
 
         playerWebView.webChromeClient = object : WebChromeClient() {
@@ -452,43 +455,51 @@ class MainActivity : AppCompatActivity() {
         return if (playUrl.isNotEmpty()) playUrl + ext else null
     }
 
-    // ★ 关键重构：将播放执行全流程日志打出，确保调用必达
+    // ★★★ 核心修复：将播放 URL 统一包装为同源 /media?u=... 彻底消除跨域阻断 ★★★
     private fun startHlsPlay(m3u8Url: String) {
-        val safe = m3u8Url.replace("\\", "\\\\").replace("'", "\\'")
+        val localPlayUrl = if (m3u8Url.startsWith("http://127.0.0.1")) {
+            m3u8Url
+        } else {
+            "http://127.0.0.1:18888/media?u=" + URLEncoder.encode(m3u8Url, "UTF-8")
+        }
+
+        val safe = localPlayUrl.replace("\\", "\\\\").replace("'", "\\'")
         val js = """
             (function() {
                 try {
-                    console.log("[Player] 开始装载播放地址: " + '$safe');
+                    console.log("[Player] 开始装载播放: " + '$safe');
                     if (typeof window.__startM3u8 === 'function') {
                         window.__startM3u8('$safe');
-                        console.log("[Player] __startM3u8 触发完成");
+                        console.log("[Player] __startM3u8 触发成功");
                     } else {
                         console.error("[Player] 错误: window.__startM3u8 尚未就绪");
                     }
                     setTimeout(function() {
-                        var v = document.querySelector('video') || document.getElementById('v');
-                        if (v) {
-                            v.muted = false;
-                            v.style.position = 'fixed';
-                            v.style.top = '0';
-                            v.style.left = '0';
-                            v.style.width = '100vw';
-                            v.style.height = '100vh';
-                            v.style.objectFit = 'contain';
-                            v.style.zIndex = '1';
-                            v.play().catch(function(e) {
-                                console.warn("[Player] video.play 异常: " + e.message);
+                        var video = document.getElementById('v') || document.querySelector('video');
+                        if (video) {
+                            video.muted = false;
+                            video.style.display = 'block';
+                            video.style.width = '100vw';
+                            video.style.height = '100vh';
+                            video.style.objectFit = 'contain';
+                            video.play().then(function() {
+                                console.log("[Player] 视频播放起播成功 (video.play OK)");
+                            }).catch(function(e) {
+                                console.warn("[Player] 自动播放拦截: " + e.message + "，尝试静音起播后恢复声音");
+                                video.muted = true;
+                                video.play().then(function() {
+                                    video.muted = false;
+                                    console.log("[Player] 已成功通过兼容模式激活画面与声音");
+                                });
                             });
                         }
-                    }, 500);
+                    }, 600);
                 } catch(e) {
-                    console.error("[Player] 注入异常: " + e.message);
+                    console.error("[Player] startHlsPlay 异常: " + e.message);
                 }
             })();
         """.trimIndent()
-        playerWebView.evaluateJavascript(js) { res ->
-            // ignore
-        }
+        playerWebView.evaluateJavascript(js, null)
     }
 
     override fun onKeyDown(keyCode: Int, event: KeyEvent?): Boolean {
