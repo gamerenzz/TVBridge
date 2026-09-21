@@ -4,13 +4,13 @@
     android:layout_height="match_parent"
     android:background="#000000">
 
-    <!-- 1. 全屏硬件加速播放层 -->
+    <!-- 1. 全屏硬件加速播放内核 (加载 player.served.html) -->
     <WebView
         android:id="@+id/playerWebView"
         android:layout_width="match_parent"
         android:layout_height="match_parent" />
 
-    <!-- 2. 顶部微型状态浮条 -->
+    <!-- 2. 顶部状态栏 -->
     <LinearLayout
         android:id="@+id/topBar"
         android:layout_width="match_parent"
@@ -56,7 +56,7 @@
             android:textSize="11sp" />
     </LinearLayout>
 
-    <!-- 3. 左侧半透明悬浮切台抽屉 -->
+    <!-- 3. 左侧半透明悬浮切台抽屉 (初始可见) -->
     <LinearLayout
         android:id="@+id/channelDrawer"
         android:layout_width="260dp"
@@ -75,6 +75,7 @@
             android:textSize="16sp"
             android:textStyle="bold" />
 
+        <!-- 分类切换 -->
         <LinearLayout
             android:layout_width="match_parent"
             android:layout_height="wrap_content"
@@ -117,18 +118,17 @@
             android:paddingTop="6dp" />
     </LinearLayout>
 
-    <!-- 4. ★ 实时日志控制台 (支持长按单选、划选、全选复制与一键复制) ★ -->
+    <!-- 4. 实时日志控制台 (支持复制全部、清空、长按选词) -->
     <LinearLayout
         android:id="@+id/logOverlay"
-        android:layout_width="480dp"
-        android:layout_height="260dp"
+        android:layout_width="460dp"
+        android:layout_height="240dp"
         android:layout_gravity="bottom|end"
         android:background="#F2000000"
         android:orientation="vertical"
         android:padding="8dp"
         android:visibility="gone">
 
-        <!-- 控制台顶栏操作区 -->
         <LinearLayout
             android:layout_width="match_parent"
             android:layout_height="wrap_content"
@@ -139,7 +139,7 @@
                 android:layout_width="0dp"
                 android:layout_height="wrap_content"
                 android:layout_weight="1"
-                android:text="运行日志 (长按文本可划选/全选):"
+                android:text="运行日志:"
                 android:textColor="#00E676"
                 android:textSize="11sp"
                 android:textStyle="bold" />
@@ -148,14 +148,14 @@
                 android:id="@+id/btnCopyAllLogs"
                 android:layout_width="wrap_content"
                 android:layout_height="wrap_content"
-                android:layout_marginEnd="8dp"
+                android:layout_marginEnd="6dp"
                 android:background="#00897B"
                 android:clickable="true"
                 android:focusable="true"
-                android:paddingStart="8dp"
-                android:paddingTop="4dp"
-                android:paddingEnd="8dp"
-                android:paddingBottom="4dp"
+                android:paddingStart="6dp"
+                android:paddingTop="3dp"
+                android:paddingEnd="6dp"
+                android:paddingBottom="3dp"
                 android:text="复制全部"
                 android:textColor="#FFFFFF"
                 android:textSize="11sp" />
@@ -164,14 +164,14 @@
                 android:id="@+id/btnClearLogs"
                 android:layout_width="wrap_content"
                 android:layout_height="wrap_content"
-                android:layout_marginEnd="8dp"
+                android:layout_marginEnd="6dp"
                 android:background="#424242"
                 android:clickable="true"
                 android:focusable="true"
-                android:paddingStart="8dp"
-                android:paddingTop="4dp"
-                android:paddingEnd="8dp"
-                android:paddingBottom="4dp"
+                android:paddingStart="6dp"
+                android:paddingTop="3dp"
+                android:paddingEnd="6dp"
+                android:paddingBottom="3dp"
                 android:text="清空"
                 android:textColor="#FF5252"
                 android:textSize="11sp" />
@@ -183,10 +183,10 @@
                 android:background="#333333"
                 android:clickable="true"
                 android:focusable="true"
-                android:paddingStart="8dp"
-                android:paddingTop="4dp"
-                android:paddingEnd="8dp"
-                android:paddingBottom="4dp"
+                android:paddingStart="6dp"
+                android:paddingTop="3dp"
+                android:paddingEnd="6dp"
+                android:paddingBottom="3dp"
                 android:text="关闭 ✕"
                 android:textColor="#FFFFFF"
                 android:textSize="11sp" />
@@ -196,11 +196,10 @@
             android:id="@+id/logScrollView"
             android:layout_width="match_parent"
             android:layout_height="match_parent"
-            android:layout_marginTop="6dp"
+            android:layout_marginTop="4dp"
             android:background="#151515"
             android:padding="6dp">
 
-            <!-- 开启 textIsSelectable 允许自由长按选词、全选、复制 -->
             <TextView
                 android:id="@+id/tvConsoleLogs"
                 android:layout_width="match_parent"
@@ -213,7 +212,7 @@
                 android:text="日志就绪..."
                 android:textColor="#A7FFEB"
                 android:textIsSelectable="true"
-                android:textSize="11sp" />
+                android:textSize="10sp" />
         </ScrollView>
     </LinearLayout>
 
