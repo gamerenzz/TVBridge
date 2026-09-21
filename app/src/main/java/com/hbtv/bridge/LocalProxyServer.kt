@@ -2,12 +2,10 @@ package com.hbtv.bridge
 
 import android.content.Context
 import fi.iki.elonen.NanoHTTPD
-import okhttp3.OkHttpClient
-import okhttp3.Request
+import okhttp3.*
 import java.io.ByteArrayInputStream
 import java.net.URL
 import java.net.URLEncoder
-import java.nio.ByteBuffer
 import java.util.concurrent.TimeUnit
 import java.util.regex.Pattern
 
@@ -18,6 +16,7 @@ class LocalProxyServer(private val context: Context, port: Int = 18888) : NanoHT
         .readTimeout(15, TimeUnit.SECONDS)
         .build()
 
+    private val chromeUA = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/150.0.0.0 Safari/537.36"
     private val hbtvReferer = "https://news.hbtv.com.cn/"
     private val tsPattern = Pattern.compile("^https://live\\d+-cjy\\.hbtv\\.com\\.cn/")
 
@@ -29,7 +28,7 @@ class LocalProxyServer(private val context: Context, port: Int = 18888) : NanoHT
 
         return try {
             when {
-                // 1. 动态生成 IPTV M3U 播放列表 (包含 61+ 频道)
+                // 1. M3U 订阅源 (供 TiviMate / PotPlayer 一键导入)
                 uri == "/live.m3u" || uri == "/" -> {
                     val m3u = StringBuilder("#EXTM3U\n")
                     for (ch in ChannelRepository.channels) {
@@ -39,76 +38,50 @@ class LocalProxyServer(private val context: Context, port: Int = 18888) : NanoHT
                     newFixedLengthResponse(Response.Status.OK, "application/vnd.apple.mpegurl", m3u.toString())
                 }
 
-                // 2. 按需取流：TiviMate 请求 /play/{cid}.m3u8
+                // 2. 播放入口：ExoPlayer / TiviMate 请求 /play/{cid}.m3u8
                 uri.startsWith("/play/") && uri.endsWith(".m3u8") -> {
                     val cid = uri.removePrefix("/play/").removeSuffix(".m3u8")
                     val ch = ChannelRepository.channels.find { it.id == cid }
                         ?: return newFixedLengthResponse(Response.Status.NOT_FOUND, "text/plain", "Channel not found")
 
-                    LogManager.log("[中继网关] 外部播放器请求: ${ch.name}")
+                    LogManager.log("[中继网关] 请求频道: ${ch.name}")
 
-                    val upstreamM3u8Url = if (ch.group == ChannelGroup.LOCAL) {
+                    val targetM3u8Url = if (ch.group == ChannelGroup.LOCAL) {
                         WebViewKeeper.getUrl(ch.id)
                     } else {
-                        StreamResolver.resolveCctvStream(ch)
+                        getCleanCctvBroadcastUrl(ch.id)
                     }
 
-                    if (upstreamM3u8Url.isNullOrEmpty()) {
-                        return newFixedLengthResponse(Response.Status.SERVICE_UNAVAILABLE, "text/plain", "Stream resolving...")
+                    if (targetM3u8Url.isNullOrEmpty()) {
+                        return newFixedLengthResponse(Response.Status.SERVICE_UNAVAILABLE, "text/plain", "Stream not ready")
                     }
 
-                    val reqBuilder = Request.Builder().url(upstreamM3u8Url).header("User-Agent", AuthSigner.Ua)
-                    if (ch.group == ChannelGroup.LOCAL) {
-                        reqBuilder.header("Referer", hbtvReferer)
-                    } else {
-                        reqBuilder.header("Referer", "https://yangshipin.cn/")
-                    }
-
-                    val resp = client.newCall(reqBuilder.build()).execute()
-                    val rawM3u8 = resp.body?.string() ?: ""
-
-                    // 解析 Master Playlist
-                    val rewrittenM3u8 = parseAndRewriteM3u8(ch, rawM3u8, upstreamM3u8Url, baseUrl)
-                    newFixedLengthResponse(Response.Status.OK, "application/vnd.apple.mpegurl", rewrittenM3u8)
+                    val rewritten = fetchAndRewriteM3u8(ch, targetM3u8Url, baseUrl)
+                    newFixedLengthResponse(Response.Status.OK, "application/vnd.apple.mpegurl", rewritten)
                 }
 
-                // 3. ★ 核心攻关：央视/卫视切片下载，经由 C 语言 JNI 原地解密还原为明文 TS ★
+                // 3. 央视/卫视分片中继
                 uri == "/cctv/seg" -> {
                     val upstreamUrl = params["u"]?.firstOrNull()
                         ?: return newFixedLengthResponse(Response.Status.BAD_REQUEST, "text/plain", "Missing u")
 
                     val req = Request.Builder().url(upstreamUrl)
-                        .header("User-Agent", AuthSigner.Ua)
-                        .header("Referer", "https://yangshipin.cn/")
+                        .header("User-Agent", chromeUA)
                         .build()
 
                     val resp = client.newCall(req).execute()
                     val rawBytes = resp.body?.bytes() ?: ByteArray(0)
-
-                    val isClearStream = upstreamUrl.contains("mobilelive") || upstreamUrl.contains("m3u8_with_time_tag")
-
-                    if (!isClearStream && rawBytes.isNotEmpty()) {
-                        // 使用 Direct ByteBuffer 零拷贝送入 C 语言解密 NALU
-                        val directBuf = ByteBuffer.allocateDirect(rawBytes.size)
-                        directBuf.put(rawBytes)
-                        directBuf.flip()
-
-                        val count = CmgNative.decryptTsInPlace(directBuf, rawBytes.size)
-                        directBuf.get(rawBytes) // 取回解密后的明文字节
-                        LogManager.log("[Native解密] 切片还原成功: ${rawBytes.size / 1024} KB (解密 $count 帧)")
-                    }
-
                     newFixedLengthResponse(Response.Status.OK, "video/mp2t", ByteArrayInputStream(rawBytes), rawBytes.size.toLong())
                 }
 
-                // 4. 湖北台分片转发
+                // 4. 湖北台分片中继 (防盗链穿透)
                 uri == "/hbtv/ts" -> {
                     val upstreamUrl = params["u"]?.firstOrNull()
                         ?: return newFixedLengthResponse(Response.Status.BAD_REQUEST, "text/plain", "Missing u")
 
                     val req = Request.Builder().url(upstreamUrl)
                         .header("Referer", hbtvReferer)
-                        .header("User-Agent", AuthSigner.Ua)
+                        .header("User-Agent", chromeUA)
                         .build()
 
                     val resp = client.newCall(req).execute()
@@ -124,10 +97,49 @@ class LocalProxyServer(private val context: Context, port: Int = 18888) : NanoHT
         }
     }
 
-    private fun parseAndRewriteM3u8(ch: TvChannel, rawContent: String, targetUrl: String, baseUrl: String): String {
-        val isLocal = (ch.group == ChannelGroup.LOCAL)
+    private fun getCleanCctvBroadcastUrl(cid: String): String {
+        return when (cid) {
+            "cctv1" -> "http://ivi.bupt.edu.cn/hls/cctv1hd.m3u8"
+            "cctv2" -> "http://ivi.bupt.edu.cn/hls/cctv2hd.m3u8"
+            "cctv3" -> "http://ivi.bupt.edu.cn/hls/cctv3hd.m3u8"
+            "cctv4" -> "http://ivi.bupt.edu.cn/hls/cctv4hd.m3u8"
+            "cctv5" -> "http://ivi.bupt.edu.cn/hls/cctv5hd.m3u8"
+            "cctv5p" -> "http://ivi.bupt.edu.cn/hls/cctv5phd.m3u8"
+            "cctv6" -> "http://ivi.bupt.edu.cn/hls/cctv6hd.m3u8"
+            "cctv7" -> "http://ivi.bupt.edu.cn/hls/cctv7hd.m3u8"
+            "cctv8" -> "http://ivi.bupt.edu.cn/hls/cctv8hd.m3u8"
+            "cctv9" -> "http://ivi.bupt.edu.cn/hls/cctv9hd.m3u8"
+            "cctv10" -> "http://ivi.bupt.edu.cn/hls/cctv10hd.m3u8"
+            "cctv11" -> "http://ivi.bupt.edu.cn/hls/cctv11hd.m3u8"
+            "cctv12" -> "http://ivi.bupt.edu.cn/hls/cctv12hd.m3u8"
+            "cctv13" -> "http://ivi.bupt.edu.cn/hls/cctv13hd.m3u8"
+            "cctv14" -> "http://ivi.bupt.edu.cn/hls/cctv14hd.m3u8"
+            "cctv15" -> "http://ivi.bupt.edu.cn/hls/cctv15hd.m3u8"
+            "cctv16" -> "http://ivi.bupt.edu.cn/hls/cctv16hd.m3u8"
+            "cctv17" -> "http://ivi.bupt.edu.cn/hls/cctv17hd.m3u8"
+            "cctv4k" -> "http://ivi.bupt.edu.cn/hls/cctv4khd.m3u8"
+            "hnws" -> "http://ivi.bupt.edu.cn/hls/hunanhd.m3u8"
+            "zjws" -> "http://ivi.bupt.edu.cn/hls/zjhd.m3u8"
+            "jsws" -> "http://ivi.bupt.edu.cn/hls/jshd.m3u8"
+            "dfws" -> "http://ivi.bupt.edu.cn/hls/dfhd.m3u8"
+            "bjws" -> "http://ivi.bupt.edu.cn/hls/btv1hd.m3u8"
+            "sdws" -> "http://ivi.bupt.edu.cn/hls/sdhd.m3u8"
+            "gdws" -> "http://ivi.bupt.edu.cn/hls/gdhd.m3u8"
+            "ahws" -> "http://ivi.bupt.edu.cn/hls/ahhd.m3u8"
+            else -> "http://ivi.bupt.edu.cn/hls/cctv1hd.m3u8"
+        }
+    }
 
-        // 递归处理多码率总索引
+    private fun fetchAndRewriteM3u8(ch: TvChannel, targetUrl: String, baseUrl: String): String {
+        val isLocal = (ch.group == ChannelGroup.LOCAL)
+        val reqBuilder = Request.Builder().url(targetUrl).header("User-Agent", chromeUA)
+        if (isLocal) {
+            reqBuilder.header("Referer", hbtvReferer)
+        }
+
+        val resp = client.newCall(reqBuilder.build()).execute()
+        val rawContent = resp.body?.string() ?: ""
+
         if (rawContent.contains("#EXT-X-STREAM-INF")) {
             val subLine = rawContent.lines().firstOrNull {
                 val t = it.trim()
@@ -136,9 +148,7 @@ class LocalProxyServer(private val context: Context, port: Int = 18888) : NanoHT
 
             if (subLine != null) {
                 val subUrl = resolveAbsoluteUrl(targetUrl, subLine)
-                val resp = client.newCall(Request.Builder().url(subUrl).header("User-Agent", AuthSigner.Ua).build()).execute()
-                val subRaw = resp.body?.string() ?: ""
-                return parseAndRewriteM3u8(ch, subRaw, subUrl, baseUrl)
+                return fetchAndRewriteM3u8(ch, subUrl, baseUrl)
             }
         }
 
@@ -152,6 +162,7 @@ class LocalProxyServer(private val context: Context, port: Int = 18888) : NanoHT
                 rawLine
             }
         }
+
         return lines.joinToString("\n")
     }
 
