@@ -26,13 +26,13 @@ import fi.iki.elonen.NanoHTTPD
 import okhttp3.OkHttpClient
 import okhttp3.Request
 import java.io.ByteArrayInputStream
+import java.net.URLDecoder
 import java.net.URLEncoder
 import java.text.SimpleDateFormat
 import java.util.*
 import java.util.concurrent.ConcurrentHashMap
 import java.util.concurrent.CopyOnWriteArrayList
 import java.util.concurrent.TimeUnit
-import java.util.regex.Pattern
 
 // ==========================================
 // 1. 频道数据定义
@@ -50,17 +50,11 @@ val CHANNELS = listOf(
 
 const val PC_UA = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
 
-// 全局强制静音 JS（在页面加载最早时机注入，篡改原型链，从根本上锁死声音输出）
-const val MUTE_INJECTION_JS = """
+// 纯静音脚本：保持播放器正常工作、正常向服务器维持心跳，但物理音量强制为 0
+const val ALWAYS_MUTE_JS = """
     (function() {
         try {
-            // 劫持 HTMLMediaElement 原型，使任何 video/audio 标签一诞生就是静音
-            HTMLMediaElement.prototype.play = function() {
-                this.muted = true;
-                this.volume = 0;
-                // 不执行真实的硬件解码播放，仅触发就绪状态
-                return Promise.resolve();
-            };
+            // 劫持所有 audio/video，强制静音，但绝不阻止 play() 流程
             Object.defineProperty(HTMLMediaElement.prototype, 'volume', {
                 set: function() {},
                 get: function() { return 0; }
@@ -69,6 +63,11 @@ const val MUTE_INJECTION_JS = """
                 set: function() {},
                 get: function() { return true; }
             });
+            var mediaList = document.querySelectorAll('video, audio');
+            for(var i = 0; i < mediaList.length; i++) {
+                mediaList[i].muted = true;
+                mediaList[i].volume = 0;
+            }
         } catch(e) {}
     })();
 """
@@ -93,7 +92,7 @@ object LogManager {
 }
 
 // ==========================================
-// 3. 6个 WebView 常驻心跳与定时续期池 (核心防休眠 & 彻底静音)
+// 3. WebView 管理器 (保持播放拉流心跳 + 强制静音)
 // ==========================================
 @SuppressLint("SetJavaScriptEnabled")
 object WebViewKeeper {
@@ -106,7 +105,6 @@ object WebViewKeeper {
     fun init(context: Context, container: ViewGroup? = null) {
         mainHandler.post {
             try {
-                // 开启 Cookie 支持
                 CookieManager.getInstance().setAcceptCookie(true)
 
                 for (ch in CHANNELS) {
@@ -115,10 +113,10 @@ object WebViewKeeper {
                         settings.javaScriptEnabled = true
                         settings.domStorageEnabled = true
                         settings.databaseEnabled = true
-                        // 阻止无需手势直接播放音视频
-                        settings.mediaPlaybackRequiresUserGesture = true
+                        // 允许页面播放，否则 Hls.js 不拉流不更新 Token
+                        settings.mediaPlaybackRequiresUserGesture = false
                         settings.mixedContentMode = WebSettings.MIXED_CONTENT_ALWAYS_ALLOW
-                        settings.userAgentString = PC_UA // 强制使用桌面端 UA
+                        settings.userAgentString = PC_UA
                         settings.cacheMode = WebSettings.LOAD_NO_CACHE
 
                         CookieManager.getInstance().setAcceptThirdPartyCookies(this, true)
@@ -126,30 +124,26 @@ object WebViewKeeper {
                         webViewClient = object : WebViewClient() {
                             override fun onPageStarted(view: WebView?, url: String?, favicon: Bitmap?) {
                                 super.onPageStarted(view, url, favicon)
-                                // 在页面刚开始解析时，极速注入静音 Hook
-                                view?.evaluateJavascript(MUTE_INJECTION_JS, null)
+                                // 在最早阶段注入静音，防止出声
+                                view?.evaluateJavascript(ALWAYS_MUTE_JS, null)
                             }
 
                             override fun onPageFinished(view: WebView?, url: String?) {
-                                // 页面加载完毕后再次确保静音
-                                view?.evaluateJavascript(MUTE_INJECTION_JS, null)
-                                LogManager.log("[${ch.name}] 页面就绪，正在提取视频流...")
+                                view?.evaluateJavascript(ALWAYS_MUTE_JS, null)
+                                LogManager.log("[${ch.name}] 页面就绪，准备取流...")
                                 scheduleCheck(ch.id, 1)
                             }
 
                             override fun onReceivedSslError(view: WebView?, handler: SslErrorHandler?, error: SslError?) {
-                                handler?.proceed() // 忽略证书异常，防止 CDN 被拦截
+                                handler?.proceed()
                             }
                         }
 
-                        // 唤醒内核渲染与心跳
                         onResume()
                         resumeTimers()
-
                         loadUrl("https://news.hbtv.com.cn/app/tv/${ch.id}")
                     }
 
-                    // 挂载到不可见视图容器，防止系统判定为游离进程而冻结
                     container?.addView(wv)
                     webViewMap[ch.id] = wv
                 }
@@ -161,29 +155,31 @@ object WebViewKeeper {
     }
 
     private fun scheduleCheck(cid: String, attempts: Int) {
-        if (attempts > 25) {
+        if (attempts > 30) {
             val name = CHANNELS.find { it.id == cid }?.name ?: cid
-            LogManager.log("[$name] 抓取超时，重载页面中...")
+            LogManager.log("[$name] 抓取超时，重试中...")
             webViewMap[cid]?.reload()
             return
         }
 
         mainHandler.postDelayed({
             val wv = webViewMap[cid] ?: return@postDelayed
-            
-            // 静默探查脚本：只取 src，不调用 play()；若找到地址，立即调用 pause() 释放解码压力
+
+            // 保持正常播放（维持 CDN 连接），但强制设置 muted=true，绝不 pause
             val js = """
                 (function(){
-                    var v = document.querySelector('video');
-                    if (v) {
-                        v.muted = true;
-                        v.volume = 0;
-                        var s = v.currentSrc || v.src || '';
-                        if (s && s.length > 5 && s.indexOf('http') === 0) {
-                            try { v.pause(); } catch(e){} // 抓到了立即暂停，彻底防止发声和耗电
-                            return s;
+                    try {
+                        var v = document.querySelector('video');
+                        if (v) {
+                            v.muted = true;
+                            v.volume = 0;
+                            try { v.play(); } catch(e){} // 保持播放器拉取切片
+                            var s = v.currentSrc || v.src || '';
+                            if (s && s.length > 5 && s.indexOf('http') === 0) {
+                                return s;
+                            }
                         }
-                    }
+                    } catch(e) {}
                     return '';
                 })()
             """.trimIndent()
@@ -193,15 +189,15 @@ object WebViewKeeper {
                 val name = CHANNELS.find { it.id == cid }?.name ?: cid
                 if (cleaned.isNotEmpty() && cleaned.startsWith("http")) {
                     liveUrls[cid] = cleaned
-                    LogManager.log("[$name] 抓取成功 (已静默): ${cleaned.take(45)}...")
+                    LogManager.log("[$name] 抓取成功: ${cleaned.take(45)}...")
                 } else {
                     if (attempts % 5 == 0) {
-                        LogManager.log("[$name] 正在解析播放流 (尝试 $attempts/25)...")
+                        LogManager.log("[$name] 解析中 (尝试 $attempts/30)...")
                     }
                     scheduleCheck(cid, attempts + 1)
                 }
             }
-        }, 1500)
+        }, 1200)
     }
 
     private fun schedulePeriodicReload() {
@@ -218,10 +214,7 @@ object WebViewKeeper {
         mainHandler.post {
             for ((_, wv) in webViewMap) {
                 try {
-                    // 彻底停止加载并暂停音频
                     wv.loadUrl("about:blank")
-                    wv.onPause()
-                    wv.pauseTimers()
                     wv.destroy()
                 } catch (e: Exception) {}
             }
@@ -232,17 +225,16 @@ object WebViewKeeper {
 }
 
 // ==========================================
-// 4. 内置轻量 HTTP 代理服务器 (补 Referer + 重写分片)
+// 4. 内置轻量 HTTP 代理服务器 (流式传输，修复播放阻断)
 // ==========================================
 class LocalProxyServer(port: Int) : NanoHTTPD(port) {
 
     private val client = OkHttpClient.Builder()
-        .connectTimeout(10, TimeUnit.SECONDS)
+        .connectTimeout(15, TimeUnit.SECONDS)
         .readTimeout(20, TimeUnit.SECONDS)
         .build()
 
     private val referer = "https://news.hbtv.com.cn/"
-    private val tsPattern = Pattern.compile("^https://live\\d+-cjy\\.hbtv\\.com\\.cn/")
 
     override fun serve(session: IHTTPSession): Response {
         val uri = session.uri
@@ -250,6 +242,7 @@ class LocalProxyServer(port: Int) : NanoHTTPD(port) {
 
         return try {
             when {
+                // 1. 播放列表文件
                 uri == "/live.m3u" || uri == "/" -> {
                     val m3u = StringBuilder("#EXTM3U\n")
                     for (ch in CHANNELS) {
@@ -259,25 +252,46 @@ class LocalProxyServer(port: Int) : NanoHTTPD(port) {
                     newFixedLengthResponse(Response.Status.OK, "application/vnd.apple.mpegurl", m3u.toString())
                 }
 
+                // 2. TS 切片透传代理 (优化内存，改为输入流转发)
                 uri == "/ts" -> {
-                    val upstreamUrl = params["u"]?.firstOrNull() ?: return newFixedLengthResponse(Response.Status.BAD_REQUEST, "text/plain", "Missing u")
-                    if (!tsPattern.matcher(upstreamUrl).find()) {
-                        return newFixedLengthResponse(Response.Status.FORBIDDEN, "text/plain", "Bad host")
+                    val rawUrl = params["u"]?.firstOrNull() ?: return newFixedLengthResponse(Response.Status.BAD_REQUEST, "text/plain", "Missing u")
+                    val upstreamUrl = URLDecoder.decode(rawUrl, "UTF-8")
+
+                    // 兼容湖北所有官方 CDN 域名校验
+                    if (!upstreamUrl.contains("hbtv.com.cn")) {
+                        LogManager.log("拦截非法TS请求: $upstreamUrl")
+                        return newFixedLengthResponse(Response.Status.FORBIDDEN, "text/plain", "Forbidden Host")
                     }
+
                     val req = Request.Builder().url(upstreamUrl)
                         .header("Referer", referer)
                         .header("User-Agent", PC_UA)
                         .build()
+
                     val resp = client.newCall(req).execute()
-                    val bytes = resp.body?.bytes() ?: ByteArray(0)
-                    newFixedLengthResponse(Response.Status.OK, "video/mp2t", ByteArrayInputStream(bytes), bytes.size.toLong())
+                    if (!resp.isSuccessful) {
+                        LogManager.log("拉取分片失败 [HTTP ${resp.code}]: $upstreamUrl")
+                        return newFixedLengthResponse(Response.Status.lookup(resp.code), "text/plain", "Upstream Error")
+                    }
+
+                    val body = resp.body ?: return newFixedLengthResponse(Response.Status.NO_CONTENT, "text/plain", "No Body")
+                    val inputStream = body.byteStream()
+                    val contentLength = body.contentLength()
+
+                    // 使用 Chunked / 固定长度响应
+                    if (contentLength > 0) {
+                        newFixedLengthResponse(Response.Status.OK, "video/mp2t", inputStream, contentLength)
+                    } else {
+                        newChunkedResponse(Response.Status.OK, "video/mp2t", inputStream)
+                    }
                 }
 
+                // 3. m3u8 实时改写与下发
                 uri.endsWith(".m3u8") -> {
                     val cid = uri.removePrefix("/").removeSuffix(".m3u8")
                     val liveUrl = WebViewKeeper.getUrl(cid)
                     if (liveUrl.isNullOrEmpty()) {
-                        LogManager.log("[$cid] 尚未就绪，重试中...")
+                        LogManager.log("[$cid] 频道流尚未就绪，请稍候重试")
                         return newFixedLengthResponse(Response.Status.SERVICE_UNAVAILABLE, "text/plain", "Stream not ready yet")
                     }
 
@@ -288,23 +302,37 @@ class LocalProxyServer(port: Int) : NanoHTTPD(port) {
                     val resp = client.newCall(req).execute()
                     val rawM3u8 = resp.body?.string() ?: ""
 
+                    if (rawM3u8.isEmpty()) {
+                        LogManager.log("[$cid] 上游返回空 m3u8")
+                        return newFixedLengthResponse(Response.Status.BAD_GATEWAY, "text/plain", "Empty Upstream M3U8")
+                    }
+
+                    // 取上级基础 URL 用于补全切片的相对路径
                     val baseUrl = liveUrl.substringBeforeLast("/") + "/"
+
                     val modifiedM3u8 = rawM3u8.lines().joinToString("\n") { line ->
                         val trimmed = line.trim()
                         if (trimmed.isNotEmpty() && !trimmed.startsWith("#")) {
-                            val absoluteTs = if (trimmed.startsWith("http")) trimmed else baseUrl + trimmed
-                            "/ts?u=" + URLEncoder.encode(absoluteTs, "UTF-8")
+                            // 处理相对路径与绝对路径
+                            val absoluteTs = if (trimmed.startsWith("http://") || trimmed.startsWith("https://")) {
+                                trimmed
+                            } else {
+                                baseUrl + trimmed
+                            }
+                            // 代理转接到本地 /ts
+                            "http://127.0.0.1:8899/ts?u=" + URLEncoder.encode(absoluteTs, "UTF-8")
                         } else {
                             line
                         }
                     }
+
                     newFixedLengthResponse(Response.Status.OK, "application/vnd.apple.mpegurl", modifiedM3u8)
                 }
 
                 else -> newFixedLengthResponse(Response.Status.NOT_FOUND, "text/plain", "Not Found")
             }
         } catch (e: Exception) {
-            LogManager.log("代理请求异常: ${e.message}")
+            LogManager.log("中继错误 [${e.javaClass.simpleName}]: ${e.message}")
             newFixedLengthResponse(Response.Status.INTERNAL_ERROR, "text/plain", e.message)
         }
     }
@@ -323,7 +351,6 @@ class BridgeService : Service() {
             startForegroundNotification()
             server = LocalProxyServer(8899).apply { start() }
             LogManager.log("本地中继服务已在 127.0.0.1:8899 启动")
-            // Service 启动时若 Activity 没运行，在此兜底初始化
             WebViewKeeper.init(this)
         } catch (e: Throwable) {
             LogManager.log("Service启动异常: ${e.message}")
@@ -340,7 +367,7 @@ class BridgeService : Service() {
             }
             val notification = NotificationCompat.Builder(this, channelId)
                 .setContentTitle("长江云直播助手运行中")
-                .setContentText("127.0.0.1:8899 正在中继 (静音模式)")
+                .setContentText("127.0.0.1:8899 正在中继 (静音就绪)")
                 .setSmallIcon(android.R.drawable.stat_notify_sync)
                 .setPriority(NotificationCompat.PRIORITY_LOW)
                 .build()
@@ -401,7 +428,6 @@ class MainActivity : AppCompatActivity() {
                         btnToggle.setBackgroundColor(0xFFD32F2F.toInt())
                         isRunning = true
                         LogManager.log("正在唤醒 6 个后台静音标签页并抓流...")
-                        // 挂载到当前主界面以激活硬件加速渲染
                         WebViewKeeper.init(this, hiddenContainer)
                     } else {
                         stopService(intent)
@@ -415,7 +441,6 @@ class MainActivity : AppCompatActivity() {
                 }
             }
 
-            // 一键复制全部日志
             btnCopy.setOnClickListener {
                 val clipboard = getSystemService(Context.CLIPBOARD_SERVICE) as ClipboardManager
                 val clip = ClipData.newPlainText("Logs", LogManager.getAllLogs())
