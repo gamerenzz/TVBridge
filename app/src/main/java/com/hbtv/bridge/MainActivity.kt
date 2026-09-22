@@ -6,6 +6,7 @@ import android.content.ClipData
 import android.content.ClipboardManager
 import android.content.Context
 import android.content.Intent
+import android.graphics.Bitmap
 import android.net.http.SslError
 import android.os.Build
 import android.os.Bundle
@@ -69,7 +70,7 @@ object LogManager {
 }
 
 // ==========================================
-// 3. 6个 WebView 常驻心跳与定时续期池 (核心防休眠增强)
+// 3. 6个 WebView 常驻心跳与定时续期池 (核心防休眠增强 & 深度绝对静音)
 // ==========================================
 @SuppressLint("SetJavaScriptEnabled")
 object WebViewKeeper {
@@ -77,12 +78,51 @@ object WebViewKeeper {
     private val webViewMap = mutableMapOf<String, WebView>()
     private val liveUrls = ConcurrentHashMap<String, String>()
 
+    // 注入彻底锁死音量与静音的 JS 脚本（覆盖属性描述符，防止页面内部脚本偷偷恢复声音）
+    private val MUTE_INJECTION_JS = """
+        (function() {
+            try {
+                // 1. 锁死所有已有 media 标签
+                var medias = document.querySelectorAll('video, audio');
+                medias.forEach(function(m) {
+                    m.muted = true;
+                    m.volume = 0;
+                });
+
+                // 2. 深度劫持 HTMLMediaElement 原型，禁止网页脚本取消静音
+                Object.defineProperty(HTMLMediaElement.prototype, 'muted', {
+                    get: function() { return true; },
+                    set: function() { /* 屏蔽设置 */ },
+                    configurable: true
+                });
+
+                Object.defineProperty(HTMLMediaElement.prototype, 'volume', {
+                    get: function() { return 0; },
+                    set: function() { /* 屏蔽设置 */ },
+                    configurable: true
+                });
+
+                // 3. 拦截 Web Audio API 声音上下文
+                if (window.AudioContext || window.webkitAudioContext) {
+                    var AudioCtx = window.AudioContext || window.webkitAudioContext;
+                    AudioCtx.prototype.createGain = function() {
+                        var node = {
+                            gain: { value: 0 },
+                            connect: function() {}
+                        };
+                        return node;
+                    };
+                }
+            } catch(e) {}
+        })();
+    """.trimIndent()
+
     fun getUrl(cid: String): String? = liveUrls[cid]
 
     fun init(context: Context, container: ViewGroup? = null) {
         mainHandler.post {
             try {
-                // 开启 Cookie 支持
+                // 开启全局 Cookie 支持
                 CookieManager.getInstance().setAcceptCookie(true)
 
                 for (ch in CHANNELS) {
@@ -99,7 +139,15 @@ object WebViewKeeper {
                         CookieManager.getInstance().setAcceptThirdPartyCookies(this, true)
 
                         webViewClient = object : WebViewClient() {
+                            override fun onPageStarted(view: WebView?, url: String?, favicon: Bitmap?) {
+                                super.onPageStarted(view, url, favicon)
+                                // 页面刚加载时立刻执行静音锁死
+                                view?.evaluateJavascript(MUTE_INJECTION_JS, null)
+                            }
+
                             override fun onPageFinished(view: WebView?, url: String?) {
+                                // 再次执行以防覆盖
+                                view?.evaluateJavascript(MUTE_INJECTION_JS, null)
                                 LogManager.log("[${ch.name}] 页面就绪，激发播放器...")
                                 scheduleCheck(ch.id, 1)
                             }
@@ -116,7 +164,7 @@ object WebViewKeeper {
                         loadUrl("https://news.hbtv.com.cn/app/tv/${ch.id}")
                     }
 
-                    // 挂载到不可见视图容器，防止系统判定为游离进程而冻结
+                    // 挂载到主界面的隐藏容器，防止进程被冷冻
                     container?.addView(wv)
                     webViewMap[ch.id] = wv
                 }
@@ -137,20 +185,24 @@ object WebViewKeeper {
 
         mainHandler.postDelayed({
             val wv = webViewMap[cid] ?: return@postDelayed
-            // 执行播放器激活脚本并取值
+            // 每次检查前强力静音，并播放触发取流
             val js = """
                 (function(){
-                    var v = document.querySelector('video');
-                    if (v) {
-                        v.muted = true;
-                        try { v.play(); } catch(e){}
-                        if (v.currentSrc && v.currentSrc.length > 5) return v.currentSrc;
-                        if (v.src && v.src.length > 5) return v.src;
-                    }
+                    try {
+                        var v = document.querySelector('video');
+                        if (v) {
+                            v.muted = true;
+                            v.volume = 0;
+                            try { v.play(); } catch(e){}
+                            if (v.currentSrc && v.currentSrc.length > 5) return v.currentSrc;
+                            if (v.src && v.src.length > 5) return v.src;
+                        }
+                    } catch(e){}
                     return '';
                 })()
             """.trimIndent()
 
+            wv.evaluateJavascript(MUTE_INJECTION_JS, null)
             wv.evaluateJavascript(js) { res ->
                 val cleaned = res?.trim('"', '\'', ' ') ?: ""
                 val name = CHANNELS.find { it.id == cid }?.name ?: cid
@@ -180,6 +232,8 @@ object WebViewKeeper {
     fun destroy() {
         mainHandler.post {
             for ((_, wv) in webViewMap) {
+                wv.stopLoading()
+                wv.loadUrl("about:blank")
                 wv.destroy()
             }
             webViewMap.clear()
@@ -280,7 +334,7 @@ class BridgeService : Service() {
             startForegroundNotification()
             server = LocalProxyServer(8899).apply { start() }
             LogManager.log("本地中继服务已在 127.0.0.1:8899 启动")
-            WebViewKeeper.init(this)
+            // 注意：WebViewKeeper 的 init 交由 Activity 统一持有着力挂载，避免双重初始化造成漏音
         } catch (e: Throwable) {
             LogManager.log("Service启动异常: ${e.message}")
         }
@@ -357,10 +411,11 @@ class MainActivity : AppCompatActivity() {
                         btnToggle.setBackgroundColor(0xFFD32F2F.toInt())
                         isRunning = true
                         LogManager.log("正在唤醒 6 个后台标签页并抓流...")
-                        // 挂载到当前主界面以激活硬件加速渲染
+                        // 挂载到主界面隐藏容器中以确保硬件激活，并保持静音
                         WebViewKeeper.init(this, hiddenContainer)
                     } else {
                         stopService(intent)
+                        WebViewKeeper.destroy()
                         btnToggle.text = "启动服务"
                         btnToggle.setBackgroundColor(0xFF2196F3.toInt())
                         isRunning = false
