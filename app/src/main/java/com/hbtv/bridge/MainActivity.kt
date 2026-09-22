@@ -50,6 +50,29 @@ val CHANNELS = listOf(
 
 const val PC_UA = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
 
+// 全局强制静音 JS（在页面加载最早时机注入，篡改原型链，从根本上锁死声音输出）
+const val MUTE_INJECTION_JS = """
+    (function() {
+        try {
+            // 劫持 HTMLMediaElement 原型，使任何 video/audio 标签一诞生就是静音
+            HTMLMediaElement.prototype.play = function() {
+                this.muted = true;
+                this.volume = 0;
+                // 不执行真实的硬件解码播放，仅触发就绪状态
+                return Promise.resolve();
+            };
+            Object.defineProperty(HTMLMediaElement.prototype, 'volume', {
+                set: function() {},
+                get: function() { return 0; }
+            });
+            Object.defineProperty(HTMLMediaElement.prototype, 'muted', {
+                set: function() {},
+                get: function() { return true; }
+            });
+        } catch(e) {}
+    })();
+"""
+
 // ==========================================
 // 2. 全局日志管理器
 // ==========================================
@@ -70,7 +93,7 @@ object LogManager {
 }
 
 // ==========================================
-// 3. 6个 WebView 常驻管理器 (彻底断音版)
+// 3. 6个 WebView 常驻心跳与定时续期池 (核心防休眠 & 彻底静音)
 // ==========================================
 @SuppressLint("SetJavaScriptEnabled")
 object WebViewKeeper {
@@ -78,50 +101,24 @@ object WebViewKeeper {
     private val webViewMap = mutableMapOf<String, WebView>()
     private val liveUrls = ConcurrentHashMap<String, String>()
 
-    // 网页级静音拦截代码，直接锁定所有音量为 0
-    private const val MUTE_SCRIPT = """
-        (function() {
-            try {
-                // 1. 强制锁死媒体标签
-                var fixMedia = function(m) {
-                    m.muted = true;
-                    m.volume = 0;
-                };
-                document.querySelectorAll('video, audio').forEach(fixMedia);
-                
-                // 2. 覆盖原型，网页代码调用 volume=1 或 muted=false 将直接无效
-                Object.defineProperty(HTMLMediaElement.prototype, 'muted', {
-                    get: function() { return true; },
-                    set: function() {},
-                    configurable: true
-                });
-                Object.defineProperty(HTMLMediaElement.prototype, 'volume', {
-                    get: function() { return 0; },
-                    set: function() {},
-                    configurable: true
-                });
-            } catch(e) {}
-        })();
-    """
-
     fun getUrl(cid: String): String? = liveUrls[cid]
 
-    fun init(context: Context, container: ViewGroup?) {
+    fun init(context: Context, container: ViewGroup? = null) {
         mainHandler.post {
             try {
+                // 开启 Cookie 支持
                 CookieManager.getInstance().setAcceptCookie(true)
 
                 for (ch in CHANNELS) {
                     if (webViewMap.containsKey(ch.id)) continue
-
-                    val wv = WebView(context).apply {
+                    val wv = WebView(context.applicationContext).apply {
                         settings.javaScriptEnabled = true
                         settings.domStorageEnabled = true
                         settings.databaseEnabled = true
-                        // 关键：必须手势才能发声
+                        // 阻止无需手势直接播放音视频
                         settings.mediaPlaybackRequiresUserGesture = true
                         settings.mixedContentMode = WebSettings.MIXED_CONTENT_ALWAYS_ALLOW
-                        settings.userAgentString = PC_UA
+                        settings.userAgentString = PC_UA // 强制使用桌面端 UA
                         settings.cacheMode = WebSettings.LOAD_NO_CACHE
 
                         CookieManager.getInstance().setAcceptThirdPartyCookies(this, true)
@@ -129,41 +126,30 @@ object WebViewKeeper {
                         webViewClient = object : WebViewClient() {
                             override fun onPageStarted(view: WebView?, url: String?, favicon: Bitmap?) {
                                 super.onPageStarted(view, url, favicon)
-                                view?.evaluateJavascript(MUTE_SCRIPT, null)
-                            }
-
-                            // 关键拦截：WebView 仅仅需要执行 JS 得到 m3u8 地址，
-                            // 坚决不给 WebView 自身下载媒体流/切片的机会，从根源掐死声音数据传输！
-                            override fun shouldInterceptRequest(
-                                view: WebView?,
-                                request: WebResourceRequest?
-                            ): WebResourceResponse? {
-                                val path = request?.url?.toString()?.lowercase() ?: ""
-                                if (path.endsWith(".ts") || path.endsWith(".aac") || path.endsWith(".m4a") || path.endsWith(".mp3")) {
-                                    // 直接阻断网页内部的音视频切片拉取
-                                    return WebResourceResponse("text/plain", "UTF-8", ByteArrayInputStream(ByteArray(0)))
-                                }
-                                return super.shouldInterceptRequest(view, request)
+                                // 在页面刚开始解析时，极速注入静音 Hook
+                                view?.evaluateJavascript(MUTE_INJECTION_JS, null)
                             }
 
                             override fun onPageFinished(view: WebView?, url: String?) {
-                                view?.evaluateJavascript(MUTE_SCRIPT, null)
-                                if (url != null && url.contains("/app/tv/")) {
-                                    LogManager.log("[${ch.name}] 页面就绪，嗅探直播流...")
-                                    scheduleCheck(ch.id, 1)
-                                }
+                                // 页面加载完毕后再次确保静音
+                                view?.evaluateJavascript(MUTE_INJECTION_JS, null)
+                                LogManager.log("[${ch.name}] 页面就绪，正在提取视频流...")
+                                scheduleCheck(ch.id, 1)
                             }
 
                             override fun onReceivedSslError(view: WebView?, handler: SslErrorHandler?, error: SslError?) {
-                                handler?.proceed()
+                                handler?.proceed() // 忽略证书异常，防止 CDN 被拦截
                             }
                         }
 
+                        // 唤醒内核渲染与心跳
                         onResume()
                         resumeTimers()
+
                         loadUrl("https://news.hbtv.com.cn/app/tv/${ch.id}")
                     }
 
+                    // 挂载到不可见视图容器，防止系统判定为游离进程而冻结
                     container?.addView(wv)
                     webViewMap[ch.id] = wv
                 }
@@ -175,70 +161,54 @@ object WebViewKeeper {
     }
 
     private fun scheduleCheck(cid: String, attempts: Int) {
-        if (attempts > 20) {
+        if (attempts > 25) {
             val name = CHANNELS.find { it.id == cid }?.name ?: cid
-            LogManager.log("[$name] 抓取超时，重载中...")
-            webViewMap[cid]?.loadUrl("https://news.hbtv.com.cn/app/tv/$cid")
+            LogManager.log("[$name] 抓取超时，重载页面中...")
+            webViewMap[cid]?.reload()
             return
         }
 
         mainHandler.postDelayed({
             val wv = webViewMap[cid] ?: return@postDelayed
-
+            
+            // 静默探查脚本：只取 src，不调用 play()；若找到地址，立即调用 pause() 释放解码压力
             val js = """
                 (function(){
-                    try {
-                        var v = document.querySelector('video');
-                        if (v) {
-                            v.muted = true;
-                            v.volume = 0;
-                            if (v.currentSrc && v.currentSrc.length > 5) return v.currentSrc;
-                            if (v.src && v.src.length > 5) return v.src;
-                            try { v.play(); } catch(e){}
+                    var v = document.querySelector('video');
+                    if (v) {
+                        v.muted = true;
+                        v.volume = 0;
+                        var s = v.currentSrc || v.src || '';
+                        if (s && s.length > 5 && s.indexOf('http') === 0) {
+                            try { v.pause(); } catch(e){} // 抓到了立即暂停，彻底防止发声和耗电
+                            return s;
                         }
-                    } catch(e){}
+                    }
                     return '';
                 })()
             """.trimIndent()
 
-            wv.evaluateJavascript(MUTE_SCRIPT, null)
             wv.evaluateJavascript(js) { res ->
                 val cleaned = res?.trim('"', '\'', ' ') ?: ""
                 val name = CHANNELS.find { it.id == cid }?.name ?: cid
-
                 if (cleaned.isNotEmpty() && cleaned.startsWith("http")) {
                     liveUrls[cid] = cleaned
-                    LogManager.log("[$name] 抓取成功: ${cleaned.take(45)}...")
-
-                    // 拿到地址，立即暂停视频并清空，防止网页端持续播放
-                    wv.evaluateJavascript("""
-                        (function(){
-                            try {
-                                var v = document.querySelector('video');
-                                if (v) {
-                                    v.pause();
-                                    v.src = '';
-                                }
-                            }catch(e){}
-                        })()
-                    """.trimIndent(), null)
-                    wv.stopLoading()
-
+                    LogManager.log("[$name] 抓取成功 (已静默): ${cleaned.take(45)}...")
                 } else {
-                    if (attempts % 4 == 0) {
-                        LogManager.log("[$name] 正在解析播放流 (尝试 $attempts/20)...")
+                    if (attempts % 5 == 0) {
+                        LogManager.log("[$name] 正在解析播放流 (尝试 $attempts/25)...")
                     }
                     scheduleCheck(cid, attempts + 1)
                 }
             }
-        }, 2000)
+        }, 1500)
     }
 
     private fun schedulePeriodicReload() {
         mainHandler.postDelayed({
             LogManager.log("执行 20 分钟定时换新续期...")
-            for ((cid, wv) in webViewMap) {
-                wv.loadUrl("https://news.hbtv.com.cn/app/tv/$cid")
+            for ((_, wv) in webViewMap) {
+                wv.reload()
             }
             schedulePeriodicReload()
         }, 20 * 60 * 1000L)
@@ -247,9 +217,13 @@ object WebViewKeeper {
     fun destroy() {
         mainHandler.post {
             for ((_, wv) in webViewMap) {
-                wv.stopLoading()
-                wv.loadUrl("about:blank")
-                wv.destroy()
+                try {
+                    // 彻底停止加载并暂停音频
+                    wv.loadUrl("about:blank")
+                    wv.onPause()
+                    wv.pauseTimers()
+                    wv.destroy()
+                } catch (e: Exception) {}
             }
             webViewMap.clear()
             liveUrls.clear()
@@ -337,7 +311,7 @@ class LocalProxyServer(port: Int) : NanoHTTPD(port) {
 }
 
 // ==========================================
-// 5. 后台前台保活服务 (纯净中继，绝不包含任何 WebView 逻辑)
+// 5. 后台前台保活服务
 // ==========================================
 class BridgeService : Service() {
 
@@ -349,7 +323,8 @@ class BridgeService : Service() {
             startForegroundNotification()
             server = LocalProxyServer(8899).apply { start() }
             LogManager.log("本地中继服务已在 127.0.0.1:8899 启动")
-            // 彻底移除此处的 WebViewKeeper.init(this)！杜绝无界面后台漏音！
+            // Service 启动时若 Activity 没运行，在此兜底初始化
+            WebViewKeeper.init(this)
         } catch (e: Throwable) {
             LogManager.log("Service启动异常: ${e.message}")
         }
@@ -365,7 +340,7 @@ class BridgeService : Service() {
             }
             val notification = NotificationCompat.Builder(this, channelId)
                 .setContentTitle("长江云直播助手运行中")
-                .setContentText("127.0.0.1:8899 正在中继")
+                .setContentText("127.0.0.1:8899 正在中继 (静音模式)")
                 .setSmallIcon(android.R.drawable.stat_notify_sync)
                 .setPriority(NotificationCompat.PRIORITY_LOW)
                 .build()
@@ -378,6 +353,7 @@ class BridgeService : Service() {
 
     override fun onDestroy() {
         server?.stop()
+        WebViewKeeper.destroy()
         LogManager.log("服务已关闭")
         super.onDestroy()
     }
@@ -386,7 +362,7 @@ class BridgeService : Service() {
 }
 
 // ==========================================
-// 6. 主界面 (唯一负责 WebViewKeeper 挂载与销毁的地方)
+// 6. 主界面
 // ==========================================
 class MainActivity : AppCompatActivity() {
 
@@ -424,12 +400,11 @@ class MainActivity : AppCompatActivity() {
                         btnToggle.text = "停止服务"
                         btnToggle.setBackgroundColor(0xFFD32F2F.toInt())
                         isRunning = true
-                        LogManager.log("正在唤醒 6 个后台标签页并抓流...")
-                        // 唯一入口：必须在此处注入，并受 hiddenContainer 强力控制
+                        LogManager.log("正在唤醒 6 个后台静音标签页并抓流...")
+                        // 挂载到当前主界面以激活硬件加速渲染
                         WebViewKeeper.init(this, hiddenContainer)
                     } else {
                         stopService(intent)
-                        WebViewKeeper.destroy()
                         btnToggle.text = "启动服务"
                         btnToggle.setBackgroundColor(0xFF2196F3.toInt())
                         isRunning = false
@@ -440,6 +415,7 @@ class MainActivity : AppCompatActivity() {
                 }
             }
 
+            // 一键复制全部日志
             btnCopy.setOnClickListener {
                 val clipboard = getSystemService(Context.CLIPBOARD_SERVICE) as ClipboardManager
                 val clip = ClipData.newPlainText("Logs", LogManager.getAllLogs())
@@ -461,11 +437,5 @@ class MainActivity : AppCompatActivity() {
                 .setPositiveButton("确定", null)
                 .show()
         }
-    }
-
-    override fun onDestroy() {
-        // 界面完全退出时清理 WebView 资源
-        WebViewKeeper.destroy()
-        super.onDestroy()
     }
 }
